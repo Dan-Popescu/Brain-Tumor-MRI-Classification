@@ -7,40 +7,15 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
-
-def _load_config(config_path: str | None) -> dict[str, Any]:
-    if not config_path:
-        return {}
-
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return {}
-
-    try:
-        import yaml  # type: ignore
-
-        parsed = yaml.safe_load(raw)
-        return parsed or {}
-    except ModuleNotFoundError:
-        pass
-    except Exception as exc:
-        raise ValueError(f"Invalid YAML config: {config_path}") from exc
-
-    try:
-        parsed = json.loads(raw)
-        return parsed or {}
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Config parsing failed. Install PyYAML or provide JSON config."
-        ) from exc
+from config_utils import (
+    as_int,
+    as_positive_int_or_none,
+    load_config,
+    parse_partition_columns,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,27 +31,6 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _as_positive_int(value: Any, field_name: str) -> int | None:
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid `{field_name}` value: {value}") from exc
-    if parsed <= 0:
-        raise ValueError(f"`{field_name}` must be > 0, got {parsed}")
-    return parsed
-
-
-def _as_int(value: Any, field_name: str, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid `{field_name}` value: {value}") from exc
-
-
 def _as_ratio(value: Any, field_name: str) -> float:
     try:
         parsed = float(value)
@@ -85,18 +39,6 @@ def _as_ratio(value: Any, field_name: str) -> float:
     if parsed <= 0.0 or parsed >= 1.0:
         raise ValueError(f"`{field_name}` must be in (0, 1), got {parsed}")
     return parsed
-
-
-def _parse_partition_columns(raw_columns: Any) -> list[str]:
-    if raw_columns is None:
-        return []
-    if isinstance(raw_columns, str):
-        return [col.strip() for col in raw_columns.split(",") if col.strip()]
-    if isinstance(raw_columns, list):
-        return [str(col).strip() for col in raw_columns if str(col).strip()]
-    raise ValueError(
-        "Invalid `partition_by` value in config. Use a comma-separated string or list."
-    )
 
 
 def _parse_split_ratios(raw_ratios: Any) -> tuple[float, float, float]:
@@ -116,16 +58,6 @@ def _parse_split_ratios(raw_ratios: Any) -> tuple[float, float, float]:
     return train_ratio, val_ratio, test_ratio
 
 
-def _resolve_local_path(path: str) -> str:
-    if path.startswith("file:"):
-        parsed = urlparse(path)
-        if parsed.scheme == "file":
-            if parsed.netloc:
-                return unquote(f"//{parsed.netloc}{parsed.path}")
-            return unquote(parsed.path or path[len("file:") :])
-    return path
-
-
 def _ratio_tag(train_ratio: float, val_ratio: float, test_ratio: float) -> str:
     return f"{int(round(train_ratio * 100))}_{int(round(val_ratio * 100))}_{int(round(test_ratio * 100))}"
 
@@ -134,7 +66,7 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
     train_ratio, val_ratio, test_ratio = _parse_split_ratios(
         config.get("split_ratios", [0.7, 0.15, 0.15])
     )
-    seed = _as_int(config.get("seed"), "seed", 42)
+    seed = as_int(config.get("seed"), "seed", 42)
     split_id = config.get("split_id")
     if split_id is not None:
         split_id = str(split_id).strip() or None
@@ -148,8 +80,14 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         output_manifest_path = str(output_manifest_path)
     else:
         output_manifest_path = str(
-            Path(output_splits_path) / split_id / "manifest.parquet"
+            Path(output_splits_path) / split_id / "training_manifest.parquet"
         )
+    current_output_manifest_path = str(
+        config.get(
+            "current_output_manifest_path",
+            Path(output_splits_path) / "current" / "training_manifest.parquet",
+        )
+    )
 
     return {
         "input_manifest_path": str(
@@ -157,6 +95,7 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "output_splits_path": output_splits_path,
         "output_manifest_path": output_manifest_path,
+        "current_output_manifest_path": current_output_manifest_path,
         "split_versions_registry_path": str(
             config.get(
                 "split_versions_registry_path",
@@ -165,11 +104,11 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "app_name": str(config.get("app_name", "mri-split")),
         "master": config.get("master"),
-        "partitions": _as_positive_int(config.get("partitions"), "partitions"),
-        "shuffle_partitions": _as_positive_int(
+        "partitions": as_positive_int_or_none(config.get("partitions"), "partitions"),
+        "shuffle_partitions": as_positive_int_or_none(
             config.get("shuffle_partitions"), "shuffle_partitions"
         ),
-        "partition_by": _parse_partition_columns(config.get("partition_by", ["split"])),
+        "partition_by": parse_partition_columns(config.get("partition_by", ["split"])),
         "split_id": split_id,
         "seed": seed,
         "train_ratio": train_ratio,
@@ -180,7 +119,7 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings(config_path: str | None = "conf/spark_split.yaml") -> dict[str, Any]:
     """Load and normalize settings from config file."""
-    return _resolve_settings(_load_config(config_path))
+    return _resolve_settings(load_config(config_path))
 
 
 def _build_split_df(manifest_df: DataFrame, settings: dict[str, Any]) -> DataFrame:
@@ -194,7 +133,6 @@ def _build_split_df(manifest_df: DataFrame, settings: dict[str, Any]) -> DataFra
     split_ratio_text = f"{train_ratio:.4f}/{val_ratio:.4f}/{settings['test_ratio']:.4f}"
 
     # Deterministic pseudo-random value in [0, 1): depends only on image_id + seed.
-    # Using SQL expr avoids PySpark stub false positives in some IDE setups.
     random_key = (
         F.pmod(
             F.xxhash64(F.concat_ws("::", F.col("image_id"), F.lit(seed_str))),
@@ -250,7 +188,6 @@ def _upsert_split_registry(
     split_counts: dict[str, int],
 ) -> str:
     registry_path = settings["split_versions_registry_path"]
-    local_registry_path = _resolve_local_path(registry_path)
 
     rows_total = int(
         split_counts.get("train", 0) + split_counts.get("val", 0) + split_counts.get("test", 0)
@@ -273,17 +210,18 @@ def _upsert_split_registry(
         settings["partitions"],
         settings["shuffle_partitions"],
     )
-    new_df = spark.createDataFrame([new_row], schema=_registry_schema())
-
-    if Path(local_registry_path).exists():
-        existing_df = spark.read.parquet(registry_path)
-        merged_df = existing_df.filter(
-            F.col("split_id") != settings["split_id"]
-        ).unionByName(new_df)
-    else:
-        merged_df = new_df
-
-    merged_df.write.mode("overwrite").parquet(registry_path)
+    conf_key = "spark.sql.sources.partitionOverwriteMode"
+    previous_overwrite_mode = spark.conf.get(conf_key, "static")
+    spark.conf.set(conf_key, "dynamic")
+    try:
+        (
+            spark.createDataFrame([new_row], schema=_registry_schema())
+            .write.mode("overwrite")
+            .partitionBy("split_id")
+            .parquet(registry_path)
+        )
+    finally:
+        spark.conf.set(conf_key, previous_overwrite_mode)
     return registry_path
 
 
@@ -325,6 +263,10 @@ def run_split(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
     if partition_by:
         writer = writer.partitionBy(*partition_by)
     writer.parquet(resolved_settings["output_manifest_path"])
+    current_writer = split_df.write.mode("overwrite")
+    if partition_by:
+        current_writer = current_writer.partitionBy(*partition_by)
+    current_writer.parquet(resolved_settings["current_output_manifest_path"])
 
     split_counts_rows = split_df.groupBy("split").count().collect()
     split_counts = {row["split"]: int(row["count"]) for row in split_counts_rows}
@@ -341,6 +283,7 @@ def run_split(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
         "rows_val": int(split_counts.get("val", 0)),
         "rows_test": int(split_counts.get("test", 0)),
         "output_manifest_path": resolved_settings["output_manifest_path"],
+        "output_current_manifest_path": resolved_settings["current_output_manifest_path"],
         "output_registry_path": registry_path,
     }
 
@@ -363,6 +306,7 @@ def main() -> None:
     print(f"[split_job] rows val: {result['rows_val']}")
     print(f"[split_job] rows test: {result['rows_test']}")
     print(f"[split_job] output manifest: {result['output_manifest_path']}")
+    print(f"[split_job] output current manifest: {result['output_current_manifest_path']}")
     print(f"[split_job] output registry: {result['output_registry_path']}")
 
     spark.stop()

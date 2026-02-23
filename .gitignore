@@ -29,6 +29,7 @@ env/
 *.log
 *.crc
 _SUCCESS
+*:Zone.Identifier
 
 playground
 

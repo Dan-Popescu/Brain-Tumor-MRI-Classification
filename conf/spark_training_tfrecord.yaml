@@ -1,0 +1,25 @@
+input_manifest_path: data/processed/splits/current/training_manifest.parquet
+
+# If output_path is omitted, output is:
+# data/processed/training_tfrecord/<export_id>
+output_root_path: data/processed/training_tfrecord
+output_path: null
+current_output_path: data/processed/training_tfrecord/current
+training_tfrecord_registry_path: data/processed/training_tfrecord_versions.parquet
+
+app_name: mri-training-tfrecord
+master: null
+
+# sharding config
+seed: 42
+n_shards: 16
+export_id: null
+
+# spark tuning
+partitions: 16
+shuffle_partitions: 16
+
+# dataframe repartitioning before TFRecord write
+partition_by:
+  - split
+  - shard_id

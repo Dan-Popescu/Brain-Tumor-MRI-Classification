@@ -1,0 +1,25 @@
+input_manifest_path: data/processed/splits/current/training_manifest.parquet
+
+
+# If output_path is omitted, output is:
+# data/processed/training_shards/<export_id>
+output_root_path: data/processed/training_shards
+output_path: null
+training_shards_registry_path: data/processed/training_shards_versions.parquet
+
+app_name: mri-training-shards
+master: null
+
+# sharding config
+seed: 42
+n_shards: 16
+export_id: null
+
+# spark tuning
+partitions: 16
+shuffle_partitions: 16
+
+# output partitioning
+partition_by:
+  - split
+  - shard_id

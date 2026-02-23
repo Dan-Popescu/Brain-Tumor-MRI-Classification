@@ -1,0 +1,428 @@
+"""Create TFRecord training shards from a split manifest."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+from urllib.parse import unquote, urlparse
+
+from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
+
+from config_utils import (
+    as_int,
+    as_positive_int,
+    as_positive_int_or_none,
+    load_config,
+    parse_partition_columns,
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export split manifest to sharded TFRecord files for training."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="conf/spark_training_tfrecord.yaml",
+        help="YAML/JSON config path",
+    )
+    return parser.parse_args()
+
+
+def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
+    seed = as_int(config.get("seed"), "seed", 42)
+    n_shards = as_positive_int(config.get("n_shards", 16), "n_shards")
+
+    export_id = config.get("export_id")
+    if export_id is not None:
+        export_id = str(export_id).strip() or None
+    if export_id is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        export_id = f"training_tfrecord_seed{seed}_n{n_shards}_{timestamp}"
+
+    output_root_path = str(
+        config.get("output_root_path", "data/processed/training_tfrecord")
+    )
+    output_path = config.get("output_path")
+    if output_path:
+        output_path = str(output_path)
+    else:
+        output_path = str(Path(output_root_path) / export_id)
+
+    return {
+        "input_manifest_path": str(
+            config.get(
+                "input_manifest_path",
+                "data/processed/splits/current/training_manifest.parquet",
+            )
+        ),
+        "output_root_path": output_root_path,
+        "output_path": output_path,
+        "current_output_path": str(
+            config.get("current_output_path", Path(output_root_path) / "current")
+        ),
+        "training_tfrecord_registry_path": str(
+            config.get(
+                "training_tfrecord_registry_path",
+                "data/processed/training_tfrecord_versions.parquet",
+            )
+        ),
+        "app_name": str(config.get("app_name", "mri-training-tfrecord")),
+        "master": config.get("master"),
+        "partitions": as_positive_int_or_none(config.get("partitions"), "partitions"),
+        "shuffle_partitions": as_positive_int_or_none(
+            config.get("shuffle_partitions"), "shuffle_partitions"
+        ),
+        "partition_by": parse_partition_columns(
+            config.get("partition_by", ["split", "shard_id"])
+        ),
+        "seed": seed,
+        "n_shards": n_shards,
+        "export_id": export_id,
+        "compression": "none",
+        "output_format": "tfrecord",
+    }
+
+
+def load_settings(
+    config_path: str | None = "conf/spark_training_tfrecord.yaml",
+) -> dict[str, Any]:
+    """Load and normalize settings from config file."""
+    return _resolve_settings(load_config(config_path))
+
+
+def _build_tfrecord_df(manifest_df: DataFrame, settings: dict[str, Any]) -> DataFrame:
+    required_columns = {"image_id", "processed_path", "label_idx", "split", "split_id"}
+    missing = sorted(required_columns - set(manifest_df.columns))
+    if missing:
+        raise ValueError(
+            "Input split manifest is missing required columns: " + ", ".join(missing)
+        )
+
+    base_df = manifest_df.select(
+        "image_id", "processed_path", "label_idx", "split", "split_id"
+    )
+    seed_str = str(settings["seed"])
+    n_shards = settings["n_shards"]
+
+    shard_id = F.pmod(
+        F.xxhash64(F.concat_ws("::", F.col("image_id"), F.lit(seed_str))),
+        F.lit(n_shards),
+    ).cast("int")
+
+    return (
+        base_df.withColumn("shard_id", shard_id)
+        .withColumn("export_id", F.lit(settings["export_id"]))
+        .withColumn("shard_seed", F.lit(settings["seed"]).cast("int"))
+        .withColumn("n_shards", F.lit(n_shards).cast("int"))
+    )
+
+
+def _resolve_local_path(path: str) -> str:
+    if path.startswith("file:"):
+        parsed = urlparse(path)
+        if parsed.scheme == "file":
+            if parsed.netloc:
+                return unquote(f"//{parsed.netloc}{parsed.path}")
+            return unquote(parsed.path or path[len("file:") :])
+    return path
+
+
+def _to_abs_local_path(path: str, project_root: str) -> Path:
+    local_path = Path(_resolve_local_path(path))
+    if local_path.is_absolute():
+        return local_path
+    return Path(project_root) / local_path
+
+
+def _prepare_output_dir(local_output_path: Path) -> None:
+    resolved = local_output_path.resolve()
+    if resolved == resolved.parent:
+        raise ValueError("Refusing to clear filesystem root as output directory.")
+    if local_output_path.is_symlink() or local_output_path.is_file():
+        local_output_path.unlink()
+    elif local_output_path.exists():
+        shutil.rmtree(local_output_path)
+    local_output_path.mkdir(parents=True, exist_ok=True)
+
+
+def _refresh_current_alias(local_output_path: Path, local_current_path: Path) -> None:
+    local_current_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_current_path.is_symlink() or local_current_path.is_file():
+        local_current_path.unlink()
+    elif local_current_path.exists():
+        shutil.rmtree(local_current_path)
+    local_current_path.symlink_to(local_output_path.resolve(), target_is_directory=True)
+
+
+def _write_partition_tfrecords(
+    partition_index: int,
+    rows: Iterable[Any],
+    output_local_root: str,
+    project_root: str,
+) -> Iterator[tuple[str, int, int]]:
+    import tensorflow as tf
+
+    output_root = Path(output_local_root)
+    root_dir = Path(project_root)
+    writers: dict[tuple[str, int], Any] = {}
+    counts: dict[tuple[str, int], int] = {}
+
+    def _bytes_feature(value: bytes):
+        return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+    def _int64_feature(value: int):
+        return tf.train.Feature(int64_list=tf.train.Int64List(value=[int(value)]))
+
+    try:
+        for row in rows:
+            split = str(row["split"])
+            shard_id = int(row["shard_id"])
+            key = (split, shard_id)
+
+            writer = writers.get(key)
+            if writer is None:
+                shard_dir = output_root / f"split={split}" / f"shard_id={shard_id}"
+                shard_dir.mkdir(parents=True, exist_ok=True)
+                file_path = shard_dir / f"part-{partition_index:05d}.tfrecord"
+                writer = tf.io.TFRecordWriter(str(file_path))
+                writers[key] = writer
+                counts[key] = 0
+
+            processed_path = Path(_resolve_local_path(str(row["processed_path"])))
+            if not processed_path.is_absolute():
+                processed_path = root_dir / processed_path
+            with processed_path.open("rb") as image_file:
+                image_bytes = image_file.read()
+
+            image_id = str(row["image_id"])
+            split_id = "" if row["split_id"] is None else str(row["split_id"])
+            label_idx = int(row["label_idx"])
+
+            example = tf.train.Example(
+                features=tf.train.Features(
+                    feature={
+                        "image_bytes": _bytes_feature(image_bytes),
+                        "label_idx": _int64_feature(label_idx),
+                        "image_id": _bytes_feature(image_id.encode("utf-8")),
+                        "split": _bytes_feature(split.encode("utf-8")),
+                        "split_id": _bytes_feature(split_id.encode("utf-8")),
+                        "shard_id": _int64_feature(shard_id),
+                    }
+                )
+            )
+            writer.write(example.SerializeToString())
+            counts[key] += 1
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+    for (split, shard_id), rows_written in counts.items():
+        if rows_written > 0:
+            yield (split, shard_id, rows_written)
+
+
+def _registry_schema() -> T.StructType:
+    return T.StructType(
+        [
+            T.StructField("export_id", T.StringType(), nullable=False),
+            T.StructField("generated_at_utc", T.StringType(), nullable=False),
+            T.StructField("seed", T.IntegerType(), nullable=False),
+            T.StructField("n_shards", T.IntegerType(), nullable=False),
+            T.StructField("rows_total", T.LongType(), nullable=False),
+            T.StructField("rows_train", T.LongType(), nullable=False),
+            T.StructField("rows_val", T.LongType(), nullable=False),
+            T.StructField("rows_test", T.LongType(), nullable=False),
+            T.StructField("distinct_labels", T.IntegerType(), nullable=False),
+            T.StructField("input_manifest_path", T.StringType(), nullable=False),
+            T.StructField("output_path", T.StringType(), nullable=False),
+            T.StructField("current_output_path", T.StringType(), nullable=False),
+            T.StructField("output_format", T.StringType(), nullable=False),
+            T.StructField("compression", T.StringType(), nullable=False),
+            T.StructField("partition_by", T.StringType(), nullable=False),
+            T.StructField("partitions", T.IntegerType(), nullable=True),
+            T.StructField("shuffle_partitions", T.IntegerType(), nullable=True),
+        ]
+    )
+
+
+def _upsert_training_tfrecord_registry(
+    spark: SparkSession,
+    settings: dict[str, Any],
+    rows_by_split: dict[str, int],
+    distinct_labels: int,
+) -> str:
+    registry_path = settings["training_tfrecord_registry_path"]
+    rows_total = int(
+        rows_by_split.get("train", 0)
+        + rows_by_split.get("val", 0)
+        + rows_by_split.get("test", 0)
+    )
+
+    new_row = (
+        settings["export_id"],
+        datetime.now(timezone.utc).isoformat(),
+        settings["seed"],
+        settings["n_shards"],
+        rows_total,
+        int(rows_by_split.get("train", 0)),
+        int(rows_by_split.get("val", 0)),
+        int(rows_by_split.get("test", 0)),
+        int(distinct_labels),
+        settings["input_manifest_path"],
+        settings["output_path"],
+        settings["current_output_path"],
+        settings["output_format"],
+        settings["compression"],
+        ",".join(settings["partition_by"]),
+        settings["partitions"],
+        settings["shuffle_partitions"],
+    )
+
+    conf_key = "spark.sql.sources.partitionOverwriteMode"
+    previous_overwrite_mode = spark.conf.get(conf_key, "static")
+    spark.conf.set(conf_key, "dynamic")
+    try:
+        (
+            spark.createDataFrame([new_row], schema=_registry_schema())
+            .write.mode("overwrite")
+            .partitionBy("export_id")
+            .parquet(registry_path)
+        )
+    finally:
+        spark.conf.set(conf_key, previous_overwrite_mode)
+    return registry_path
+
+
+def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
+    """Run TFRecord export pipeline from normalized or partial settings."""
+    resolved_settings = _resolve_settings(settings)
+
+    if resolved_settings["shuffle_partitions"]:
+        spark.conf.set(
+            "spark.sql.shuffle.partitions",
+            resolved_settings["shuffle_partitions"],
+        )
+
+    manifest_df = spark.read.parquet(resolved_settings["input_manifest_path"])
+    tfrecord_df = _build_tfrecord_df(manifest_df, resolved_settings)
+
+    input_counts_rows = manifest_df.groupBy("split").count().collect()
+    rows_by_split_input = {row["split"]: int(row["count"]) for row in input_counts_rows}
+    rows_input_total = int(sum(rows_by_split_input.values()))
+    distinct_labels = int(manifest_df.select("label_idx").distinct().count())
+
+    partition_by = resolved_settings["partition_by"]
+    if partition_by:
+        unknown = [col for col in partition_by if col not in tfrecord_df.columns]
+        if unknown:
+            raise ValueError(
+                "Unknown partition columns: "
+                + ", ".join(unknown)
+                + ". Available columns: "
+                + ", ".join(tfrecord_df.columns)
+            )
+
+    if resolved_settings["partitions"]:
+        if partition_by:
+            tfrecord_df = tfrecord_df.repartition(
+                resolved_settings["partitions"], *partition_by
+            )
+        else:
+            tfrecord_df = tfrecord_df.repartition(resolved_settings["partitions"])
+    elif partition_by:
+        tfrecord_df = tfrecord_df.repartition(*partition_by)
+
+    project_root = str(Path.cwd().resolve())
+    local_output_path = _to_abs_local_path(resolved_settings["output_path"], project_root)
+    _prepare_output_dir(local_output_path)
+
+    write_counts = tfrecord_df.rdd.mapPartitionsWithIndex(
+        lambda partition_index, rows: _write_partition_tfrecords(
+            partition_index=partition_index,
+            rows=rows,
+            output_local_root=str(local_output_path),
+            project_root=project_root,
+        )
+    ).collect()
+
+    rows_by_split_written: dict[str, int] = {}
+    rows_written_total = 0
+    for split, _shard_id, rows_written in write_counts:
+        rows_by_split_written[split] = rows_by_split_written.get(split, 0) + int(
+            rows_written
+        )
+        rows_written_total += int(rows_written)
+
+    split_keys = sorted(set(rows_by_split_input.keys()) | set(rows_by_split_written.keys()))
+    mismatches = [
+        f"{split}: input={rows_by_split_input.get(split, 0)} output={rows_by_split_written.get(split, 0)}"
+        for split in split_keys
+        if rows_by_split_input.get(split, 0) != rows_by_split_written.get(split, 0)
+    ]
+    if rows_input_total != rows_written_total or mismatches:
+        raise ValueError(
+            "TFRecord write validation failed. "
+            f"rows_total input={rows_input_total}, output={rows_written_total}. "
+            + ("; ".join(mismatches) if mismatches else "")
+        )
+
+    local_current_path = _to_abs_local_path(
+        resolved_settings["current_output_path"], project_root
+    )
+    if local_current_path.resolve() == local_output_path.resolve():
+        raise ValueError("`current_output_path` must be different from `output_path`.")
+    _refresh_current_alias(local_output_path, local_current_path)
+
+    registry_path = _upsert_training_tfrecord_registry(
+        spark=spark,
+        settings=resolved_settings,
+        rows_by_split=rows_by_split_written,
+        distinct_labels=distinct_labels,
+    )
+
+    return {
+        "settings": resolved_settings,
+        "rows_total": int(rows_written_total),
+        "rows_train": int(rows_by_split_written.get("train", 0)),
+        "rows_val": int(rows_by_split_written.get("val", 0)),
+        "rows_test": int(rows_by_split_written.get("test", 0)),
+        "distinct_labels": int(distinct_labels),
+        "output_path": resolved_settings["output_path"],
+        "output_current_path": resolved_settings["current_output_path"],
+        "output_registry_path": registry_path,
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+    settings = load_settings(args.config)
+
+    spark_builder = SparkSession.builder.appName(settings["app_name"])
+    if settings["master"]:
+        spark_builder = spark_builder.master(settings["master"])
+    spark = spark_builder.getOrCreate()
+
+    result = run_training_tfrecord(spark, settings)
+
+    print("[training_tfrecord_job] settings:")
+    print(json.dumps(result["settings"], indent=2))
+    print(f"[training_tfrecord_job] rows total: {result['rows_total']}")
+    print(f"[training_tfrecord_job] rows train: {result['rows_train']}")
+    print(f"[training_tfrecord_job] rows val: {result['rows_val']}")
+    print(f"[training_tfrecord_job] rows test: {result['rows_test']}")
+    print(f"[training_tfrecord_job] distinct labels: {result['distinct_labels']}")
+    print(f"[training_tfrecord_job] output path: {result['output_path']}")
+    print(f"[training_tfrecord_job] output current path: {result['output_current_path']}")
+    print(f"[training_tfrecord_job] output registry: {result['output_registry_path']}")
+
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
