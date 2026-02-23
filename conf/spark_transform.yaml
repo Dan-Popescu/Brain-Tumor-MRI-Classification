@@ -1,0 +1,21 @@
+input_manifest_path: data/processed/manifest_bronze.parquet
+output_images_path: data/processed/images_silver
+output_manifest_path: data/processed/manifest_silver.parquet
+versions_registry_path: data/processed/transform_versions.parquet
+
+app_name: mri-transform
+master: null
+
+# resize config
+target_size: [224, 224]
+resize_strategy: keep_aspect_pad
+transform_version: v1
+
+# spark tuning
+partitions: 16
+shuffle_partitions: 16
+
+# output manifest partitioning
+partition_by:
+  - pathology
+  - modality

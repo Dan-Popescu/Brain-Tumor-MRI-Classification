@@ -1,0 +1,14 @@
+input_path: data/raw
+output_manifest_path: data/processed/manifest_bronze.parquet
+app_name: mri-manifest-preprocess
+master: null
+
+# Optional tuning
+partitions: 12           # local setting
+shuffle_partitions: 16  # global setting
+
+# Output layout
+partition_by:
+  - pathology
+  - modality
+sort_within_partitions: true

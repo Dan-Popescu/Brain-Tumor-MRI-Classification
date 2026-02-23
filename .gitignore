@@ -2,8 +2,13 @@
 data/raw/*
 !data/raw/.gitkeep
 
-models/saved_model/*
-!models/saved_model/.gitkeep
+# Generated data artifacts (large / reproducible)
+data/processed/*
+!data/processed/.gitkeep
+
+# Model artifacts
+models/*
+!models/.gitkeep
 
 __pycache__/
 *.py[cod]
@@ -22,3 +27,8 @@ env/
 .ipynb_checkpoints/
 
 *.log
+*.crc
+_SUCCESS
+
+playground
+

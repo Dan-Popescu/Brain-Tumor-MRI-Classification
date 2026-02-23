@@ -6,3 +6,4 @@ plotly
 pyspark
 streamlit
 pillow
+tensorflow

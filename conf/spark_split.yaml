@@ -1,0 +1,23 @@
+input_manifest_path: data/processed/manifest_silver.parquet
+
+# If output_manifest_path is omitted, output is:
+# data/processed/splits/<split_id>/manifest.parquet
+output_splits_path: data/processed/splits
+output_manifest_path: null
+split_versions_registry_path: data/processed/split_versions.parquet
+
+app_name: mri-split
+master: null
+
+# split config
+seed: 42
+split_id: null
+split_ratios: [0.7, 0.15, 0.15]
+
+# spark tuning
+partitions: 16
+shuffle_partitions: 16
+
+# output manifest partitioning
+partition_by:
+  - split
