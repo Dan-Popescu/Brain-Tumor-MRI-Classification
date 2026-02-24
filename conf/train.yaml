@@ -1,0 +1,21 @@
+input_tfrecord_path: data/processed/training_tfrecord/current
+seed: 42
+
+# Model/input params
+image_size: [224, 224] # [height, width]
+batch_size: 32
+epochs: 30
+learning_rate: 0.001
+shuffle_buffer: 2048
+num_classes: null # null = infer from TFRecord labels
+
+# Optional manual limits (null = auto from row counts)
+steps_per_epoch: null
+validation_steps: null
+early_stopping_patience: 10
+
+# Artifacts
+model_output_dir: models/baseline_cnn
+best_model_filename: best.keras
+final_model_filename: final.keras
+run_summary_filename: train_run_summary.json

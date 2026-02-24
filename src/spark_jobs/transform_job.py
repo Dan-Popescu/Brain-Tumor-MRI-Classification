@@ -16,36 +16,12 @@ from pyspark.sql import DataFrame, SparkSession, Row
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-
-def _load_config(config_path: str | None) -> dict[str, Any]:
-    if not config_path:
-        return {}
-
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return {}
-
-    try:
-        import yaml  # type: ignore
-
-        parsed = yaml.safe_load(raw)
-        return parsed or {}
-    except ModuleNotFoundError:
-        pass
-    except Exception as exc:
-        raise ValueError(f"Invalid YAML config: {config_path}") from exc
-
-    try:
-        parsed = json.loads(raw)
-        return parsed or {}
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Config parsing failed. Install PyYAML or provide JSON config."
-        ) from exc
+from config_utils import (
+    as_positive_int,
+    as_positive_int_or_none,
+    load_config,
+    parse_partition_columns,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,39 +37,10 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _as_positive_int(value: Any, field_name: str) -> int | None:
-    if value is None:
-        return None
-
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid `{field_name}` value: {value}") from exc
-
-    if parsed <= 0:
-        raise ValueError(f"`{field_name}` must be > 0, got {parsed}")
-
-    return parsed
-
-
-def _parse_partition_columns(raw_columns: Any) -> list[str]:
-    if raw_columns is None:
-        return []
-    if isinstance(raw_columns, str):
-        return [col.strip() for col in raw_columns.split(",") if col.strip()]
-    if isinstance(raw_columns, list):
-        return [str(col).strip() for col in raw_columns if str(col).strip()]
-    raise ValueError(
-        "Invalid `partition_by` value in config. Use a comma-separated string or list."
-    )
-
-
 def _parse_target_size(raw_size: Any) -> tuple[int, int]:
     if isinstance(raw_size, (list, tuple)) and len(raw_size) == 2:
-        width = _as_positive_int(raw_size[0], "target_size[0]")
-        height = _as_positive_int(raw_size[1], "target_size[1]")
-        if width is None or height is None:
-            raise ValueError("`target_size` values must be positive integers")
+        width = as_positive_int(raw_size[0], "target_size[0]")
+        height = as_positive_int(raw_size[1], "target_size[1]")
         return width, height
 
     raise ValueError("Invalid `target_size`. Expected [width, height].")
@@ -126,11 +73,11 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "app_name": config.get("app_name", "mri-transform"),
         "master": config.get("master"),
-        "partitions": _as_positive_int(config.get("partitions"), "partitions"),
-        "shuffle_partitions": _as_positive_int(
+        "partitions": as_positive_int_or_none(config.get("partitions"), "partitions"),
+        "shuffle_partitions": as_positive_int_or_none(
             config.get("shuffle_partitions"), "shuffle_partitions"
         ),
-        "partition_by": _parse_partition_columns(
+        "partition_by": parse_partition_columns(
             config.get("partition_by", ["pathology", "modality"])
         ),
         "transform_version": str(config.get("transform_version", "v1")),
@@ -142,11 +89,21 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings(config_path: str | None = "conf/spark_transform.yaml") -> dict[str, Any]:
     """Load and normalize settings from config file."""
-    return _resolve_settings(_load_config(config_path))
+    return _resolve_settings(load_config(config_path))
 
 
 def _safe_partition_value(value: Any) -> str:
     return str(value).replace("/", "_")
+
+
+def _resolve_local_path(path: str) -> str:
+    if path.startswith("file:"):
+        parsed = urlparse(path)
+        if parsed.scheme == "file":
+            if parsed.netloc:
+                return unquote(f"//{parsed.netloc}{parsed.path}")
+            return unquote(parsed.path or path[len("file:") :])
+    return path
 
 
 def _resample_filter() -> Any:
@@ -259,7 +216,7 @@ def _upsert_transform_registry(
     rows_written: int,
 ) -> str:
     registry_path = str(settings["versions_registry_path"])
-    local_registry_path = _resolve_local_raw_path(registry_path)
+    local_registry_path = _resolve_local_path(registry_path)
 
     new_row = (
         settings["transform_version"],
@@ -291,17 +248,6 @@ def _upsert_transform_registry(
     return registry_path
 
 
-def _resolve_local_raw_path(raw_path: str) -> str:
-    """Convert file URI paths from Spark (file:/...) to local filesystem paths."""
-    if raw_path.startswith("file:"):
-        parsed = urlparse(raw_path)
-        if parsed.scheme == "file":
-            if parsed.netloc:
-                return unquote(f"//{parsed.netloc}{parsed.path}")
-            return unquote(parsed.path or raw_path[len("file:") :])
-    return raw_path
-
-
 def _transform_row(
     row: Row,
     output_images_path: str,
@@ -328,7 +274,7 @@ def _transform_row(
 
     os.makedirs(Path(output_path).parent, exist_ok=True)
 
-    local_raw_path = _resolve_local_raw_path(raw_path)
+    local_raw_path = _resolve_local_path(raw_path)
     with Image.open(local_raw_path) as image:
         gray = image.convert("L")
         orig_w, orig_h = gray.size

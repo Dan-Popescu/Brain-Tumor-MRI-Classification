@@ -1,46 +1,19 @@
-#!/usr/bin/env python3
 """Spark preprocessing job: manifest-only (no image transform)."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Any, cast
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
-
-def _load_config(config_path: str | None) -> dict[str, Any]:
-    if not config_path:
-        return {}
-
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return {}
-
-    # Try YAML first when available, then JSON as fallback.
-    try:
-        import yaml  # type: ignore
-
-        parsed = yaml.safe_load(raw)
-        return parsed or {}
-    except ModuleNotFoundError:
-        pass
-    except Exception as exc:
-        raise ValueError(f"Invalid YAML config: {config_path}") from exc
-
-    try:
-        parsed = json.loads(raw)
-        return parsed or {}
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Config parsing failed. Install PyYAML or provide JSON config."
-        ) from exc
+from config_utils import (
+    as_bool,
+    as_positive_int_or_none,
+    load_config,
+    parse_partition_columns,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,55 +29,8 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _parse_partition_columns(raw_columns: Any) -> list[str]:
-    if raw_columns is None:
-        return []
-
-    if isinstance(raw_columns, str):
-        return [col.strip() for col in raw_columns.split(",") if col.strip()]
-
-    if isinstance(raw_columns, list):
-        return [str(col).strip() for col in raw_columns if str(col).strip()]
-
-    raise ValueError(
-        "Invalid `partition_by` value in config. Use a comma-separated string or list."
-    )
-
-
-def _as_positive_int(value: Any, field_name: str) -> int | None:
-    if value is None:
-        return None
-
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid `{field_name}` value: {value}") from exc
-
-    if parsed <= 0:
-        raise ValueError(f"`{field_name}` must be > 0, got {parsed}")
-
-    return parsed
-
-
-def _as_bool(value: Any, field_name: str, default: bool) -> bool:
-    if value is None:
-        return default
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "y"}:
-            return True
-        if normalized in {"0", "false", "no", "n"}:
-            return False
-
-    raise ValueError(f"Invalid `{field_name}` value: {value}")
-
-
 def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
-    partition_by = _parse_partition_columns(config.get("partition_by", ["pathology", "modality"]))
+    partition_by = parse_partition_columns(config.get("partition_by", ["pathology", "modality"]))
 
     return {
         "input_path": config.get("input_path", "data/raw"),
@@ -113,12 +39,12 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "app_name": config.get("app_name", "mri-manifest-preprocess"),
         "master": config.get("master"),
-        "partitions": _as_positive_int(config.get("partitions"), "partitions"),
-        "shuffle_partitions": _as_positive_int(
+        "partitions": as_positive_int_or_none(config.get("partitions"), "partitions"),
+        "shuffle_partitions": as_positive_int_or_none(
             config.get("shuffle_partitions"), "shuffle_partitions"
         ),
         "partition_by": partition_by,
-        "sort_within_partitions": _as_bool(
+        "sort_within_partitions": as_bool(
             config.get("sort_within_partitions"), "sort_within_partitions", True
         ),
     }
@@ -126,7 +52,7 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings(config_path: str | None = "conf/spark_preprocess.yaml") -> dict[str, Any]:
     """Load and normalize settings from config file."""
-    return _resolve_settings(_load_config(config_path))
+    return _resolve_settings(load_config(config_path))
 
 
 def _build_base_df(spark: SparkSession, input_path: str) -> DataFrame:
@@ -155,8 +81,6 @@ def _build_label_mapping(df: DataFrame) -> DataFrame:
         ]
     )
 
-    # Pathology cardinality is expected to be low; collecting labels keeps mapping deterministic
-    # and removes the global Window step that forces a single partition.
     labels = [
         row["pathology"]
         for row in df.select("pathology")
