@@ -158,12 +158,19 @@ def _parse_tfrecord(
     image = tf.image.decode_image(
         parsed["image_bytes"], channels=1, expand_animations=False
     )
-    image = tf.image.resize(
-        image,
-        [image_height, image_width],
-        method=tf.image.ResizeMethod.BILINEAR,
-        antialias=True,
+
+    # Verify shape
+    shape = tf.shape(image)
+    tf.debugging.assert_equal(
+        shape[0], image_height,  message="Image height mismatch in TFRecord. Image Height does not match target image height defined in train.yaml"
     )
+    tf.debugging.assert_equal(
+        shape[1], image_width, message="Image width mismatch in TFRecord. Image width does not match target image width defined in train.yaml"
+    )
+    tf.debugging.assert_equal(
+        shape[2], 1, message="Image channel mismatch in TFRecord. Image in tfrecord is not grayscale. Expected grayscale. Verify pipeline."
+    )
+
     image = tf.cast(image, tf.float32) / 255.0
     image.set_shape((image_height, image_width, 1))
     label = tf.cast(parsed["label_idx"], tf.int32)

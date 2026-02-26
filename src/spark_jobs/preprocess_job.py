@@ -62,13 +62,11 @@ def _build_base_df(spark: SparkSession, input_path: str) -> DataFrame:
         .load(input_path)
     )
 
-    # Keep only actual image files and ignore Windows metadata sidecar files.
-    image_pattern = r"(?i)\.(jpg|jpeg|webp)$"
+    # Keep only actual image files and ignore Windows metadata side-files.
+    image_pattern = r"(?i)\.(jpg|jpeg|png)$"
 
     return (
-        df.filter(~F.col("path").endswith(":Zone.Identifier"))
-        .filter(~F.col("path").endswith(".gitkeep"))
-        .filter(F.col("path").rlike(image_pattern))
+        df.filter(F.col("path").rlike(image_pattern))
     )
 
 

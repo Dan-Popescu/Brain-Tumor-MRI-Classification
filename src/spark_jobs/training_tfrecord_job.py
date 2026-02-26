@@ -20,6 +20,9 @@ from config_utils import (
     parse_partition_columns,
 )
 
+# from project_paths import PROJECT_ROOT
+# project_root = str(PROJECT_ROOT)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -312,7 +315,7 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     manifest_df = spark.read.parquet(resolved_settings["input_manifest_path"])
     tfrecord_df = _build_tfrecord_df(manifest_df, resolved_settings)
 
-    input_counts_rows = manifest_df.groupBy("split").count().collect()
+    input_counts_rows = manifest_df.groupBy("split").count().collect()  # 3 rows
     rows_by_split_input = {row["split"]: int(row["count"]) for row in input_counts_rows}
     rows_input_total = int(sum(rows_by_split_input.values()))
     distinct_labels = int(manifest_df.select("label_idx").distinct().count())
@@ -342,35 +345,44 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     local_output_path = _to_abs_local_path(resolved_settings["output_path"], project_root)
     _prepare_output_dir(local_output_path)
 
-    write_counts = tfrecord_df.rdd.mapPartitionsWithIndex(
+    # execute once for each partition
+    write_counts_rdd = tfrecord_df.rdd.mapPartitionsWithIndex(
         lambda partition_index, rows: _write_partition_tfrecords(
             partition_index=partition_index,
             rows=rows,
             output_local_root=str(local_output_path),
             project_root=project_root,
         )
-    ).collect()
+    )
 
-    rows_by_split_written: dict[str, int] = {}
-    rows_written_total = 0
-    for split, _shard_id, rows_written in write_counts:
-        rows_by_split_written[split] = rows_by_split_written.get(split, 0) + int(
-            rows_written
-        )
-        rows_written_total += int(rows_written)
+    write_counts_df = spark.createDataFrame(
+        write_counts_rdd,
+        "split string, shard_id int, rows_written long"
+    )
 
-    split_keys = sorted(set(rows_by_split_input.keys()) | set(rows_by_split_written.keys()))
-    mismatches = [
-        f"{split}: input={rows_by_split_input.get(split, 0)} output={rows_by_split_written.get(split, 0)}"
-        for split in split_keys
-        if rows_by_split_input.get(split, 0) != rows_by_split_written.get(split, 0)
-    ]
-    if rows_input_total != rows_written_total or mismatches:
-        raise ValueError(
-            "TFRecord write validation failed. "
-            f"rows_total input={rows_input_total}, output={rows_written_total}. "
-            + ("; ".join(mismatches) if mismatches else "")
-        )
+    input_counts_df = (
+        manifest_df.groupBy("split")
+        .count()
+        .withColumnRenamed("count", "input_count")
+    )
+
+    output_counts_df = (
+        write_counts_df.groupBy("split")
+        .agg(F.sum("rows_written").alias("output_count"))
+    )
+
+    mismatch_df = (
+        input_counts_df.join(output_counts_df, on="split", how="full")
+        .na.fill(0, ["input_count", "output_count"])
+        .where(F.col("input_count") != F.col("output_count"))
+    )
+
+    if mismatch_df.count() > 0:
+        raise ValueError("TFRecord write validation failed")
+
+    # After a successful mismatch check, output counts are identical to input counts.
+    rows_by_split_written = dict(rows_by_split_input)
+    rows_written_total = int(rows_input_total)
 
     local_current_path = _to_abs_local_path(
         resolved_settings["current_output_path"], project_root
