@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 from typing import Any, cast
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
@@ -13,6 +15,7 @@ from config_utils import (
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
+    resolve_local_path,
 )
 
 
@@ -47,6 +50,9 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         "sort_within_partitions": as_bool(
             config.get("sort_within_partitions"), "sort_within_partitions", True
         ),
+        "include_hidden_input_paths": as_bool(
+            config.get("include_hidden_input_paths"), "include_hidden_input_paths", True
+        ),
     }
 
 
@@ -55,7 +61,45 @@ def load_settings(config_path: str | None = "conf/spark_preprocess.yaml") -> dic
     return _resolve_settings(load_config(config_path))
 
 
-def _build_base_df(spark: SparkSession, input_path: str) -> DataFrame:
+def _to_abs_local_path(path: str) -> Path:
+    local = Path(resolve_local_path(path))
+    if local.is_absolute():
+        return local
+    return (Path.cwd() / local).resolve()
+
+
+def _build_base_df(
+    spark: SparkSession, input_path: str, include_hidden_input_paths: bool
+) -> DataFrame:
+    if include_hidden_input_paths:
+        local_root = _to_abs_local_path(input_path)
+        if not local_root.exists():
+            raise FileNotFoundError(f"Input path not found: {local_root}")
+
+        rows: list[tuple[str, int]] = []
+        for root, dirnames, filenames in os.walk(local_root):
+            dirnames.sort()
+            filenames.sort()
+            for filename in filenames:
+                # Ignore hidden side-files.
+                if filename.startswith("."):
+                    continue
+                suffix = Path(filename).suffix.lower()
+                if suffix not in {".jpg", ".jpeg", ".png"}:
+                    continue
+                file_path = Path(root) / filename
+                rows.append((str(file_path), int(file_path.stat().st_size)))
+
+        return spark.createDataFrame(
+            rows,
+            schema=T.StructType(
+                [
+                    T.StructField("path", T.StringType(), nullable=False),
+                    T.StructField("length", T.LongType(), nullable=False),
+                ]
+            ),
+        )
+
     df = (
         spark.read.format("binaryFile")
         .option("recursiveFileLookup", "true")
@@ -67,6 +111,10 @@ def _build_base_df(spark: SparkSession, input_path: str) -> DataFrame:
 
     return (
         df.filter(F.col("path").rlike(image_pattern))
+        # Keep data under directories like `_NORMAL ...` while excluding hidden side-files.
+        .withColumn("__filename", F.regexp_extract(F.col("path"), r"([^/\\]+)$", 1))
+        .filter(~F.col("__filename").rlike(r"^\."))
+        .drop("__filename")
     )
 
 
@@ -93,7 +141,7 @@ def _build_label_mapping(df: DataFrame) -> DataFrame:
 
 
 def _enrich_manifest(df: DataFrame) -> DataFrame:
-    parent_dir_pattern = r"/([^/]+)/[^/]+$"
+    parent_dir_pattern = r"[/\\]([^/\\]+)[/\\][^/\\]+$"
     modality_pattern = r"(T1C\+|T1|T2)$"
     pathology_pattern = r"^(.*)\s+(?:T1C\+|T1|T2)$"
 
@@ -136,7 +184,11 @@ def run_preprocess(spark: SparkSession, settings: dict[str, Any]) -> dict[str, A
             resolved_settings["shuffle_partitions"],
         )
 
-    input_df = _build_base_df(spark, resolved_settings["input_path"])
+    input_df = _build_base_df(
+        spark,
+        resolved_settings["input_path"],
+        resolved_settings["include_hidden_input_paths"],
+    )
     manifest_df = _enrich_manifest(input_df)
 
     partition_by = resolved_settings["partition_by"]

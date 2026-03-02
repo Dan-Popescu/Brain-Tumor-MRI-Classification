@@ -12,3 +12,7 @@ partition_by:
   - pathology
   - modality
 sort_within_partitions: true
+
+# Include directories/files that start with `_` (e.g. `_NORMAL T1`)
+# while still filtering image extensions in code.
+include_hidden_input_paths: true
