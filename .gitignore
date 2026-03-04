@@ -5,6 +5,7 @@ data/raw/*
 # Generated data artifacts (large / reproducible)
 data/processed/*
 !data/processed/.gitkeep
+data/debug/*
 
 # Model artifacts
 models/*

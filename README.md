@@ -2,7 +2,7 @@
 
 Projet de classification d'IRM cérébrales avec pipeline Spark (préparation des données) et TensorFlow (entraînement).
 
-## Démarrage rapide (équipe)
+## Démarrage rapide
 
 Ces étapes sont celles à suivre sur une nouvelle machine.
 
@@ -81,6 +81,15 @@ Les configs se trouvent dans `conf/`:
 - `conf/spark_training_tfrecord.yaml`
 - `conf/train.yaml`
 
+
+Pour exporter un petit aperçu visuel (debug):
+```yaml
+debug_export_enabled: true
+debug_export_n: 100
+debug_export_per_class: null   # ex: 10 pour 10 images par classe
+debug_export_path: data/debug/transform_preview
+```
+
 Chaque wrapper accepte un chemin de config en argument:
 ```bash
 scripts/run_preprocess.sh conf/spark_preprocess.yaml
@@ -95,9 +104,9 @@ Puis, pour le mettre à jour:
 scripts/bootstrap_conda.sh --name mri-brain-tumor-alice --update
 ```
 
-## Pourquoi ces scripts évitent les erreurs fréquentes
+## Note sur les scripts des jobs spark
 
-- Les wrappers `scripts/run_*.sh` forcent l'exécution depuis la racine du projet, ce qui stabilise les chemins relatifs.
+- Les wrappers `scripts/run_*.sh` forcent l'exécution des jobs spark depuis la racine
 - L'activation conda configure automatiquement:
   - `JAVA_HOME=$CONDA_PREFIX`
   - `PYSPARK_PYTHON=$CONDA_PREFIX/bin/python`

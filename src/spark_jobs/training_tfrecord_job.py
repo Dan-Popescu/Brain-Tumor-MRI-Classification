@@ -100,7 +100,7 @@ def load_settings(
 
 
 def _build_tfrecord_df(manifest_df: DataFrame, settings: dict[str, Any]) -> DataFrame:
-    required_columns = {"image_id", "processed_path", "label_idx", "split", "split_id"}
+    required_columns = {"image_id", "processed_bytes", "label_idx", "split", "split_id"}
     missing = sorted(required_columns - set(manifest_df.columns))
     if missing:
         raise ValueError(
@@ -108,7 +108,11 @@ def _build_tfrecord_df(manifest_df: DataFrame, settings: dict[str, Any]) -> Data
         )
 
     base_df = manifest_df.select(
-        "image_id", "processed_path", "label_idx", "split", "split_id"
+        F.col("image_id"),
+        F.col("processed_bytes"),
+        F.col("label_idx"),
+        F.col("split"),
+        F.col("split_id"),
     )
     seed_str = str(settings["seed"])
     n_shards = settings["n_shards"]
@@ -167,12 +171,10 @@ def _write_partition_tfrecords(
     partition_index: int,
     rows: Iterable[Any],
     output_local_root: str,
-    project_root: str,
 ) -> Iterator[tuple[str, int, int]]:
     import tensorflow as tf
 
     output_root = Path(output_local_root)
-    root_dir = Path(project_root)
     writers: dict[tuple[str, int], Any] = {}
     counts: dict[tuple[str, int], int] = {}
 
@@ -197,11 +199,10 @@ def _write_partition_tfrecords(
                 writers[key] = writer
                 counts[key] = 0
 
-            processed_path = Path(_resolve_local_path(str(row["processed_path"])))
-            if not processed_path.is_absolute():
-                processed_path = root_dir / processed_path
-            with processed_path.open("rb") as image_file:
-                image_bytes = image_file.read()
+            image_bytes_value = row["processed_bytes"]
+            if image_bytes_value is None:
+                raise ValueError("Missing required `processed_bytes` for a row.")
+            image_bytes = bytes(image_bytes_value)
 
             image_id = str(row["image_id"])
             split_id = "" if row["split_id"] is None else str(row["split_id"])
@@ -351,7 +352,6 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
             partition_index=partition_index,
             rows=rows,
             output_local_root=str(local_output_path),
-            project_root=project_root,
         )
     )
 

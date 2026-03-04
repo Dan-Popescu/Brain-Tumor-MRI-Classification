@@ -11,6 +11,13 @@ target_size: [224, 224]
 resize_strategy: keep_aspect_pad
 transform_version: v1
 
+# optional visual debug export (small sample only)
+debug_export_enabled: true
+debug_export_path: data/debug/transform_preview
+debug_export_n: 100
+debug_export_per_class: null
+debug_export_seed: 42
+
 # spark tuning
 partitions: 16
 shuffle_partitions: 16
