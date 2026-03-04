@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,9 +49,6 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         "sort_within_partitions": as_bool(
             config.get("sort_within_partitions"), "sort_within_partitions", True
         ),
-        "include_hidden_input_paths": as_bool(
-            config.get("include_hidden_input_paths"), "include_hidden_input_paths", True
-        ),
     }
 
 
@@ -68,42 +64,34 @@ def _to_abs_local_path(path: str) -> Path:
     return (Path.cwd() / local).resolve()
 
 
-def _build_base_df(
-    spark: SparkSession, input_path: str, include_hidden_input_paths: bool
-) -> DataFrame:
-    if include_hidden_input_paths:
-        local_root = _to_abs_local_path(input_path)
-        if not local_root.exists():
-            raise FileNotFoundError(f"Input path not found: {local_root}")
+def _resolve_binary_input_paths(input_path: str) -> list[str]:
+    """Resolve top-level class directories as explicit binaryFile inputs.
 
-        rows: list[tuple[str, int]] = []
-        for root, dirnames, filenames in os.walk(local_root):
-            dirnames.sort()
-            filenames.sort()
-            for filename in filenames:
-                # Ignore hidden side-files.
-                if filename.startswith("."):
-                    continue
-                suffix = Path(filename).suffix.lower()
-                if suffix not in {".jpg", ".jpeg", ".png"}:
-                    continue
-                file_path = Path(root) / filename
-                rows.append((str(file_path), int(file_path.stat().st_size)))
+    Passing explicit class directories allows Spark to read folders like `_NORMAL ...`
+    while still keeping file listing and decoding distributed.
+    """
+    local_root = _to_abs_local_path(input_path)
+    if not local_root.exists():
+        raise FileNotFoundError(f"Input path not found: {local_root}")
+    if not local_root.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {local_root}")
 
-        return spark.createDataFrame(
-            rows,
-            schema=T.StructType(
-                [
-                    T.StructField("path", T.StringType(), nullable=False),
-                    T.StructField("length", T.LongType(), nullable=False),
-                ]
-            ),
-        )
+    class_dirs = sorted(
+        path
+        for path in local_root.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    if class_dirs:
+        return [str(path) for path in class_dirs]
+    return [str(local_root)]
 
+
+def _build_base_df(spark: SparkSession, input_path: str) -> DataFrame:
+    input_paths = _resolve_binary_input_paths(input_path)
     df = (
         spark.read.format("binaryFile")
         .option("recursiveFileLookup", "true")
-        .load(input_path)
+        .load(input_paths)
     )
 
     # Keep only actual image files and ignore Windows metadata side-files.
@@ -187,7 +175,6 @@ def run_preprocess(spark: SparkSession, settings: dict[str, Any]) -> dict[str, A
     input_df = _build_base_df(
         spark,
         resolved_settings["input_path"],
-        resolved_settings["include_hidden_input_paths"],
     )
     manifest_df = _enrich_manifest(input_df)
 
