@@ -15,6 +15,7 @@ Runs:
   3) split
   4) training_tfrecord
   5) train (unless --no-train)
+  6) train_anomaly (unless --no-train)
 
 Environment overrides:
   PREPROCESS_CONFIG
@@ -22,6 +23,7 @@ Environment overrides:
   SPLIT_CONFIG
   TFRECORD_CONFIG
   TRAIN_CONFIG
+  TRAIN_ANOMALY_CONFIG
 USAGE
 }
 
@@ -50,4 +52,5 @@ done
 
 if [[ "${run_train}" == "1" ]]; then
   "${script_dir}/run_train.sh" "${TRAIN_CONFIG:-conf/train.yaml}"
+  "${script_dir}/run_train_anomaly.sh" "${TRAIN_ANOMALY_CONFIG:-conf/train_anomaly.yaml}"
 fi
