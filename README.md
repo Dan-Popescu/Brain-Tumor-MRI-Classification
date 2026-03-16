@@ -54,6 +54,13 @@ conda activate mri-brain-tumor
 python scripts/doctor.py
 ```
 
+## Application Streamlit
+
+Pour lancer l'application web (classification + détection d'anomalies):
+```bash
+streamlit run app/app.py
+```
+
 ## Exécution par étape
 
 Si vous voulez lancer les jobs un par un:
@@ -64,6 +71,7 @@ scripts/run_transform.sh
 scripts/run_split.sh
 scripts/run_training_tfrecord.sh
 scripts/run_train.sh
+scripts/run_train_anomaly.sh
 ```
 
 Sans entraînement final:
