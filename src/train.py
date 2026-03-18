@@ -224,15 +224,26 @@ def _build_model(
 ) -> tf.keras.Model:
     model = tf.keras.Sequential(
         [
+            # block 1
             tf.keras.layers.Input(shape=(image_height, image_width, 1)),
-            tf.keras.layers.Conv2D(32, kernel_size=3, activation="relu"),
-            tf.keras.layers.MaxPooling2D(),
-            tf.keras.layers.Conv2D(64, kernel_size=3, activation="relu"),
-            tf.keras.layers.MaxPooling2D(),
-            tf.keras.layers.Conv2D(64, kernel_size=3, activation="relu"),
+            tf.keras.layers.Conv2D(32, (3, 3), activation="relu"),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
+            
+            # block 2
+            tf.keras.layers.Conv2D(64, (3, 3), activation="relu"),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
+
+            # block 3
+            tf.keras.layers.Conv2D(128, (3, 3), activation="relu"),
+            tf.keras.layers.BatchNormalization(),
+            tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
+
+            # block 4, denser layers
             tf.keras.layers.GlobalAveragePooling2D(),
-            tf.keras.layers.Dense(32, activation="relu"),
-            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(512, activation="relu"),
+            tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Dense(num_classes, activation="softmax"),
         ]
     )
