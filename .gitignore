@@ -6,6 +6,8 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 data/debug/*
+data/inference/*
+!data/inference/.gitkeep
 
 # Model artifacts
 models/*

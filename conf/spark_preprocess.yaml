@@ -4,8 +4,8 @@ app_name: mri-manifest-preprocess
 master: null
 
 # Optional tuning
-partitions: 12           # local setting
-shuffle_partitions: 16  # global setting
+partitions: 8           # local setting
+shuffle_partitions: 8  # global setting
 
 # Output layout
 partition_by:

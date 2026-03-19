@@ -54,3 +54,5 @@ if [[ "${run_train}" == "1" ]]; then
   "${script_dir}/run_train.sh" "${TRAIN_CONFIG:-conf/train.yaml}"
   "${script_dir}/run_train_anomaly.sh" "${TRAIN_ANOMALY_CONFIG:-conf/train_anomaly.yaml}"
 fi
+
+"${script_dir}/run_inference_worker.sh" "${INFERENCE_WORKER_CONFIG:-conf/spark_inference.yaml}"

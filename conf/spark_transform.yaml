@@ -19,8 +19,8 @@ debug_export_per_class: null
 debug_export_seed: 42
 
 # spark tuning
-partitions: 16
-shuffle_partitions: 16
+partitions: 8
+shuffle_partitions: 8
 
 # output manifest partitioning
 partition_by:

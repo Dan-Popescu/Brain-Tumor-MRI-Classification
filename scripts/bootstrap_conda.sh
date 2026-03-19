@@ -116,8 +116,10 @@ else
   run_conda env create -n "${env_name}" -f "${env_file}"
 fi
 
-printf '[bootstrap] Installing activation hooks...\n'
+printf '[bootstrap] Installing conda hooks...\n'
 "${script_dir}/install_conda_hooks.sh" "${env_name}"
+printf '[bootstrap] Installing project PYTHONPATH hook...\n'
+"${script_dir}/install_project_pythonpath_hook.sh" "${env_name}"
 
 if [[ "${with_gpu}" == "1" ]]; then
   if [[ "$(uname -s)" != "Linux" ]]; then
@@ -126,7 +128,7 @@ if [[ "${with_gpu}" == "1" ]]; then
   fi
 
   printf '[bootstrap] Installing TensorFlow CUDA extras in "%s"...\n' "${env_name}"
-  run_conda run -n "${env_name}" pip install --upgrade "tensorflow[and-cuda]==2.16.2"
+  run_conda run -n "${env_name}" pip install --upgrade "tensorflow[and-cuda]==2.20.0"
 fi
 
 cat <<EOF
@@ -135,5 +137,6 @@ Bootstrap complete.
 Next steps:
   1) conda activate ${env_name}
   2) python scripts/doctor.py
-  3) scripts/run_preprocess.sh
+  3) chmod +x scripts/run_pipeline.sh
+  4) scripts/run_pipeline.sh
 EOF

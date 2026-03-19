@@ -16,8 +16,8 @@ n_shards: 16
 export_id: null
 
 # spark tuning
-partitions: 16
-shuffle_partitions: 16
+partitions: 8
+shuffle_partitions: 8
 
 # dataframe repartitioning before TFRecord write
 partition_by:

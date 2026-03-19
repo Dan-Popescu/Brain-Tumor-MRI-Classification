@@ -16,8 +16,8 @@ split_id: null
 split_ratios: [0.7, 0.15, 0.15]
 
 # spark tuning
-partitions: 16
-shuffle_partitions: 16
+partitions: 8
+shuffle_partitions: 8
 
 # output manifest partitioning
 partition_by:

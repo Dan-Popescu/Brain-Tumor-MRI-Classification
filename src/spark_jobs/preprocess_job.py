@@ -9,7 +9,7 @@ from typing import Any, cast
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
-from config_utils import (
+from spark_jobs.config_utils import (
     as_bool,
     as_positive_int_or_none,
     load_config,

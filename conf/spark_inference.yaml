@@ -1,0 +1,26 @@
+# input_manifest_path: data/inference/requests/current/manifest_silver.parquet
+input_manifest_path: data/processed/manifest_silver.parquet
+output_predictions_path: data/inference/results/current/predictions.parquet 
+output_artifacts_path: data/inference/results/current/artifacts 
+inference_versions_registry_path: data/processed/inference_versions.parquet 
+
+app_name: mri-inference 
+master: local[] 
+
+models:
+  classifier_model_path: models/baseline_cnn/best.keras 
+  autoencoder_model_path: models/anomaly_autoencoder/best_autoencoder.keras 
+  autoencoder_threshold_path: models/anomaly_autoencoder/anomaly_threshold.json 
+
+enabled_outputs:
+  - classification
+  - anomaly_autoencoder
+  # - gradcam
+
+write_visual_artifacts: false 
+top_k: 5 
+threshold_mode: strict 
+
+partitions: 1
+partition_by: []
+
