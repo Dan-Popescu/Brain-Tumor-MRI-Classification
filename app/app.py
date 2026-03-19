@@ -1,19 +1,19 @@
-"""Streamlit app: Brain Tumor Classification + Anomaly Detection."""
-
 from __future__ import annotations
 
 import json
+import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import numpy as np
+import pandas as pd
 import streamlit as st
-import tensorflow as tf
 from PIL import Image
 
-# ── Paths (defaults – adjust if models are elsewhere) ────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
+REQUESTS_ROOT = PROJECT_ROOT / "data" / "inference" / "requests"
 CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "models" / "baseline_cnn" / "best.keras"
 AUTOENCODER_MODEL_PATH = (
     PROJECT_ROOT / "models" / "anomaly_autoencoder" / "best_autoencoder.keras"
@@ -21,132 +21,329 @@ AUTOENCODER_MODEL_PATH = (
 THRESHOLD_PATH = (
     PROJECT_ROOT / "models" / "anomaly_autoencoder" / "anomaly_threshold.json"
 )
-
-# Label names in alphabetical order (same order as preprocess_job label_idx)
-LABEL_NAMES: list[str] = [
-    "Astrocitoma",
-    "Carcinoma",
-    "Ependimoma",
-    "Ganglioglioma",
-    "Germinoma",
-    "Glioblastoma",
-    "Granuloma",
-    "Meduloblastoma",
-    "Meningioma",
-    "Neurocitoma",
-    "Oligodendroglioma",
-    "Papiloma",
-    "Schwannoma",
-    "Tuberculoma",
-    "_NORMAL",
-]
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
-# ── Cached model loading ─────────────────────────────────────────────────────
+def _request_id() -> str:
+    return datetime.now(UTC).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
 
 
-@st.cache_resource
-def load_classifier() -> tf.keras.Model | None:
-    path = CLASSIFIER_MODEL_PATH
+def _request_dir(request_id: str) -> Path:
+    return REQUESTS_ROOT / request_id
+
+
+def _find_request_dir(request_id: str) -> Path | None:
+    direct = _request_dir(request_id)
+    if direct.exists():
+        return direct
+    return None
+
+
+def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return None
-    return tf.keras.models.load_model(str(path))
-
-
-@st.cache_resource
-def load_autoencoder() -> tf.keras.Model | None:
-    path = AUTOENCODER_MODEL_PATH
-    if not path.exists():
-        return None
-    return tf.keras.models.load_model(str(path))
-
-
-@st.cache_data
-def load_threshold() -> dict | None:
-    path = THRESHOLD_PATH
-    if not path.exists():
-        return None
+        return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-# ── Image preprocessing ──────────────────────────────────────────────────────
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def preprocess_image(
-    pil_image: Image.Image, target_height: int, target_width: int
-) -> np.ndarray:
-    """Convert uploaded image to model-ready array (1, H, W, 1) float32 in [0,1]."""
-    gray = pil_image.convert("L")
-
-    # Resize with aspect ratio preservation + padding (same as transform_job)
-    orig_w, orig_h = gray.size
-    scale = min(target_width / orig_w, target_height / orig_h)
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
-    resized = gray.resize((new_w, new_h), Image.LANCZOS)
-
-    # Center-pad to target size
-    padded = Image.new("L", (target_width, target_height), color=0)
-    paste_x = (target_width - new_w) // 2
-    paste_y = (target_height - new_h) // 2
-    padded.paste(resized, (paste_x, paste_y))
-
-    arr = np.array(padded, dtype=np.float32) / 255.0
-    return arr.reshape(1, target_height, target_width, 1)
+def _load_threshold_info() -> dict[str, Any] | None:
+    if not THRESHOLD_PATH.exists():
+        return None
+    return _read_json(THRESHOLD_PATH)
 
 
-# ── Anomaly heatmap ──────────────────────────────────────────────────────────
+def _read_predictions_preview(request_dir: Path) -> dict[str, Any] | None:
+    predictions_path = request_dir / "predictions.parquet"
+    if not predictions_path.exists():
+        return None
+
+    df = pd.read_parquet(predictions_path)
+    if df.empty:
+        return None
+
+    return df.iloc[0].to_dict()
 
 
-def compute_anomaly_map(
-    model: tf.keras.Model,
-    image_array: np.ndarray,
-    threshold: float,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Return (error_map, binary_mask, max_error).
-
-    error_map : (H, W) per-pixel MSE
-    binary_mask : (H, W) bool – True where error > threshold
-    max_error : scalar – maximum pixel error
-    """
-    reconstructed = model.predict(image_array, verbose=0)
-    error_map = np.square(image_array[0, :, :, 0] - reconstructed[0, :, :, 0])
-    binary_mask = error_map > threshold
-    max_error = float(np.max(error_map))
-    return error_map, binary_mask, max_error
+def _parse_top5(first_prediction: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = first_prediction.get("classifier_topk_json")
+    if not raw:
+        return []
+    return json.loads(raw)
 
 
-def overlay_heatmap(
-    original_gray: np.ndarray,
-    error_map: np.ndarray,
-    binary_mask: np.ndarray,
-    alpha: float = 0.5,
-) -> np.ndarray:
-    """Create an RGB overlay: original in gray, anomalous pixels highlighted red."""
-    # Normalize error map for visualization
-    if error_map.max() > 0:
-        norm_error = error_map / error_map.max()
+def _artifact_path(request_dir: Path, first_prediction: dict[str, Any], key: str) -> Path | None:
+    raw_value = first_prediction.get(key)
+    if raw_value:
+        candidate = Path(str(raw_value))
+        if candidate.exists():
+            return candidate
+
+    image_id = first_prediction.get("image_id")
+    if not image_id:
+        return None
+
+    suffix_by_key = {
+        "reconstruction_path": f"{image_id}_reconstruction.png",
+        "error_map_path": f"{image_id}_error_map.png",
+        "anomaly_overlay_path": f"{image_id}_anomaly_overlay.png",
+    }
+    suffix = suffix_by_key.get(key)
+    if suffix is None:
+        return None
+
+    fallback = request_dir / "artifacts" / suffix
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def _request_raw_image(request_dir: Path) -> Path | None:
+    raw_dir = request_dir / "raw"
+    if not raw_dir.exists():
+        return None
+    files = [path for path in raw_dir.rglob("*") if path.is_file()]
+    if not files:
+        return None
+    return files[0]
+
+
+def _resolve_total_pixels(
+    first_prediction: dict[str, Any],
+    threshold_info: dict[str, Any] | None,
+) -> int | None:
+    height = first_prediction.get("new_height") or first_prediction.get("image_height")
+    width = first_prediction.get("new_width") or first_prediction.get("image_width")
+    if height is not None and width is not None:
+        return int(height) * int(width)
+
+    if threshold_info is not None:
+        image_height = threshold_info.get("image_height")
+        image_width = threshold_info.get("image_width")
+        if image_height is not None and image_width is not None:
+            return int(image_height) * int(image_width)
+
+    anomalous_pixels = first_prediction.get("anomalous_pixel_count")
+    anomaly_ratio = first_prediction.get("anomaly_ratio")
+    if anomalous_pixels is not None and anomaly_ratio:
+        ratio = float(anomaly_ratio)
+        if ratio > 0:
+            return int(round(int(anomalous_pixels) / ratio))
+
+    return None
+
+
+def _render_processing_indicator(status: dict[str, Any], current_state: str) -> None:
+    started_at = status.get("started_at")
+    status_label = "Pending" if current_state in {"pending", "queued"} else "Processing"
+    st.write(f"Status: `{status_label}`")
+    if started_at:
+        st.caption(f"Started at {started_at}")
+
+
+def _submit_request(uploaded_file, threshold_mode: str) -> str:
+    request_id = _request_id()
+    request_dir = _request_dir(request_id)
+    raw_dir = request_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = uploaded_file.name or "uploaded_image.png"
+    raw_path = raw_dir / filename
+    raw_path.write_bytes(uploaded_file.getvalue())
+
+    _write_json(
+        request_dir / "metadata.json",
+        {
+            "request_id": request_id,
+            "created_at": _utc_now_iso(),
+            "source": "streamlit_app_new",
+            "filename": filename,
+            "write_visual_artifacts": True,
+            "partitions": 1,
+            "partition_by": [],
+            "enabled_outputs": ["classification", "anomaly_autoencoder"],
+            "threshold_mode": threshold_mode,
+        },
+    )
+    _write_json(
+        request_dir / "status.json",
+        {
+            "request_id": request_id,
+            "status": "pending",
+            "updated_at": _utc_now_iso(),
+        },
+    )
+
+    return request_id
+
+
+def _show_request_status(
+    request_id: str,
+    *,
+    debug_mode: bool,
+    refresh_interval_seconds: float,
+    threshold_info: dict[str, Any] | None,
+) -> None:
+    request_dir = _find_request_dir(request_id)
+    if request_dir is None:
+        st.warning("Request not found.")
+        return
+
+    status = _read_json(request_dir / "status.json")
+    result = _read_json(request_dir / "result.json")
+    error = _read_json(request_dir / "error.json")
+    first_prediction = _read_predictions_preview(request_dir)
+    raw_image_path = _request_raw_image(request_dir)
+
+    current_state = status.get("status", "unknown")
+
+    if current_state in {
+        "pending",
+        "queued",
+        "processing",
+        "resolving_input",
+        "building_bronze",
+        "building_silver",
+        "running_inference",
+        "writing_results",
+    }:
+        _render_processing_indicator(status, current_state)
+        time.sleep(refresh_interval_seconds)
+        st.rerun()
+        return
+
+    st.write(f"Status: `{current_state}`")
+
+    if error:
+        st.subheader("Error")
+        st.error(error.get("error_message", "An error occurred."))
+        if debug_mode:
+            st.json(status)
+            st.json(error)
+        return
+
+    if raw_image_path is not None:
+        st.image(Image.open(raw_image_path), caption="Uploaded MRI", width=300)
+
+    if result and debug_mode:
+        st.subheader("Technical Result")
+        st.json(result)
+
+    if first_prediction is None:
+        if debug_mode:
+            st.json(status)
+        return
+
+    top5_predictions = _parse_top5(first_prediction)
+
+    st.subheader("Tumor Classification")
+    pred_label = first_prediction.get("classifier_pred_label")
+    confidence = first_prediction.get("classifier_confidence")
+
+    class_metrics_col1, class_metrics_col2 = st.columns(2)
+    with class_metrics_col1:
+        st.metric("Predicted Class", pred_label)
+    with class_metrics_col2:
+        if confidence is not None:
+            st.metric("Confidence", f"{float(confidence):.2%}")
+
+    st.markdown("**Top 5 Predictions:**")
+    for rank, prediction in enumerate(top5_predictions, 1):
+        name = prediction["label_name"]
+        prob = float(prediction["probability"])
+        bar_width = int(prob * 100)
+        st.markdown(
+            f"{rank}. **{name}** — {prob:.2%} "
+            f"`{'█' * max(1, bar_width // 5)}{'░' * (20 - max(1, bar_width // 5))}`"
+        )
+
+    st.subheader("Anomaly Detection")
+    is_anomalous = bool(first_prediction.get("anomaly_is_detected"))
+    anomalous_pixels = first_prediction.get("anomalous_pixel_count")
+    anomaly_ratio = first_prediction.get("anomaly_ratio")
+    anomaly_max_error = first_prediction.get("anomaly_max_error")
+    anomaly_threshold = first_prediction.get("anomaly_threshold")
+
+    if is_anomalous:
+        st.error(
+            f"Anomaly detected. {anomalous_pixels:,} pixels "
+            f"({float(anomaly_ratio):.2%}) exceed threshold."
+        )
     else:
-        norm_error = error_map
+        st.success("No anomalous pixels detected (appears normal).")
 
-    # Build RGB from grayscale original
-    h, w = original_gray.shape
-    rgb = np.stack([original_gray] * 3, axis=-1)  # (H, W, 3)
+    anomaly_metrics_col1, anomaly_metrics_col2, anomaly_metrics_col3 = st.columns(3)
+    total_pixels = _resolve_total_pixels(first_prediction, threshold_info)
+    with anomaly_metrics_col1:
+        if anomaly_max_error is not None:
+            st.metric("Max Pixel Error", f"{float(anomaly_max_error):.6f}")
+    with anomaly_metrics_col2:
+        if anomaly_threshold is not None:
+            st.metric("Active Threshold", f"{float(anomaly_threshold):.6f}")
+    with anomaly_metrics_col3:
+        if anomalous_pixels is not None and total_pixels is not None:
+            st.metric(
+                "Anomalous Pixels",
+                f"{int(anomalous_pixels):,} / {int(total_pixels):,}",
+                delta=f"{float(anomaly_ratio):.2%}" if anomaly_ratio is not None else None,
+            )
+        elif anomalous_pixels is not None:
+            st.metric(
+                "Anomalous Pixels",
+                f"{int(anomalous_pixels):,}",
+                delta=f"{float(anomaly_ratio):.2%}" if anomaly_ratio is not None else None,
+            )
 
-    # Red overlay where mask is True
-    overlay = rgb.copy()
-    overlay[binary_mask, 0] = np.clip(
-        overlay[binary_mask, 0] * (1 - alpha) + alpha * norm_error[binary_mask] * 255,
-        0,
-        255,
-    ).astype(np.uint8)
-    overlay[binary_mask, 1] = (overlay[binary_mask, 1] * (1 - alpha)).astype(np.uint8)
-    overlay[binary_mask, 2] = (overlay[binary_mask, 2] * (1 - alpha)).astype(np.uint8)
+    anomaly_overlay_path = _artifact_path(
+        request_dir,
+        first_prediction,
+        "anomaly_overlay_path",
+    )
+    error_map_path = _artifact_path(
+        request_dir,
+        first_prediction,
+        "error_map_path",
+    )
+    reconstruction_path = _artifact_path(
+        request_dir,
+        first_prediction,
+        "reconstruction_path",
+    )
 
-    return overlay
+    image_col1, image_col2, image_col3 = st.columns(3)
 
+    with image_col1:
+        if anomaly_overlay_path is not None:
+            st.image(
+                Image.open(anomaly_overlay_path),
+                caption="Anomaly Overlay",
+                use_container_width=True,
+            )
 
-# ── Streamlit UI ─────────────────────────────────────────────────────────────
+    with image_col2:
+        if error_map_path is not None:
+            st.image(
+                Image.open(error_map_path),
+                caption="Reconstruction Error Map",
+                use_container_width=True,
+            )
+
+    with image_col3:
+        if reconstruction_path is not None:
+            st.image(
+                Image.open(reconstruction_path),
+                caption="Autoencoder Reconstruction",
+                use_container_width=True,
+            )
+
+    if debug_mode:
+        st.subheader("Debug")
+        st.json(status)
+        if result:
+            st.json(result)
 
 
 def main() -> None:
@@ -155,177 +352,60 @@ def main() -> None:
         page_icon="🧠",
         layout="wide",
     )
-
     st.title("🧠 Brain Tumor MRI Analysis")
-    st.markdown(
-        "Upload a brain MRI scan to **classify the tumor type** and "
-        "**detect anomalous regions** via reconstruction-based anomaly detection."
+    st.write(
+        "This version uses the inference worker for prediction while preserving "
+        "the same display style as the original app."
     )
 
-    # Sidebar – model status
     st.sidebar.header("Model Status")
-    classifier = load_classifier()
-    autoencoder = load_autoencoder()
-    threshold_info = load_threshold()
-
-    if classifier is not None:
-        st.sidebar.success("✅ Classifier loaded")
+    if CLASSIFIER_MODEL_PATH.exists():
+        st.sidebar.success("✅ Classifier available")
     else:
         st.sidebar.error(f"❌ Classifier not found at `{CLASSIFIER_MODEL_PATH}`")
 
-    if autoencoder is not None and threshold_info is not None:
-        st.sidebar.success("✅ Anomaly autoencoder loaded")
+    threshold_info = _load_threshold_info()
+    if AUTOENCODER_MODEL_PATH.exists() and threshold_info is not None:
+        st.sidebar.success("✅ Anomaly autoencoder available")
         st.sidebar.info(
             f"Strict threshold: {threshold_info['threshold_strict']:.6f}\n\n"
-            f"Normal images used for calibration: {threshold_info['normal_images_evaluated']}"
+            f"Normal images used for calibration: "
+            f"{threshold_info['normal_images_evaluated']}"
         )
     else:
         st.sidebar.warning("⚠️ Anomaly model or threshold not found")
 
-    # Sidebar – threshold selector
-    threshold_mode = "strict"
-    if threshold_info is not None:
-        threshold_mode = st.sidebar.selectbox(
-            "Anomaly Threshold",
-            ["strict", "p99", "p95", "custom"],
-            help=(
-                "**strict**: guarantees 0% false positives on normal scans. "
-                "**p99/p95**: slightly more sensitive. "
-                "**custom**: set your own value."
-            ),
-        )
-    custom_threshold: float | None = None
-    if threshold_mode == "custom" and threshold_info is not None:
-        custom_threshold = st.sidebar.slider(
-            "Custom threshold",
-            min_value=0.0,
-            max_value=float(threshold_info["threshold_strict"]) * 2,
-            value=float(threshold_info["threshold_strict"]),
-            step=0.0001,
-            format="%.6f",
-        )
+    threshold_mode = st.sidebar.selectbox(
+        "Anomaly Threshold",
+        ["strict", "p99", "p95"],
+        help="Threshold mode passed to the inference worker.",
+    )
+    debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 
-    # ── File uploader ──
     uploaded_file = st.file_uploader(
-        "Upload a brain MRI image",
-        type=["jpg", "jpeg", "png"],
-        help="Supported formats: JPEG, PNG",
+        "Upload an MRI image",
+        type=["png", "jpg", "jpeg"],
     )
 
-    if uploaded_file is None:
-        st.info("👆 Upload an MRI image to get started.")
-        return
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Uploaded image", width=320)
 
-    pil_image = Image.open(uploaded_file)
-    st.image(pil_image, caption="Uploaded MRI", use_container_width=False, width=300)
+    if st.button("Submit to worker", disabled=uploaded_file is None):
+        request_id = _submit_request(uploaded_file, threshold_mode)
+        st.session_state["request_id"] = request_id
+        st.rerun()
 
-    # Determine image dimensions from threshold info or default
-    img_h = threshold_info["image_height"] if threshold_info else 224
-    img_w = threshold_info["image_width"] if threshold_info else 224
-
-    image_array = preprocess_image(pil_image, img_h, img_w)
-
-    col1, col2 = st.columns(2)
-
-    # ── Classification ──
-    with col1:
-        st.subheader("🔬 Tumor Classification")
-        if classifier is not None:
-            preds = classifier.predict(image_array, verbose=0)
-            pred_idx = int(np.argmax(preds[0]))
-            confidence = float(preds[0][pred_idx])
-
-            if pred_idx < len(LABEL_NAMES):
-                pred_label = LABEL_NAMES[pred_idx]
-            else:
-                pred_label = f"Unknown (idx={pred_idx})"
-
-            st.metric("Predicted Class", pred_label)
-            st.metric("Confidence", f"{confidence:.2%}")
-
-            # Show top-5 predictions
-            top5_indices = np.argsort(preds[0])[::-1][:5]
-            st.markdown("**Top 5 Predictions:**")
-            for rank, idx in enumerate(top5_indices, 1):
-                name = LABEL_NAMES[idx] if idx < len(LABEL_NAMES) else f"idx={idx}"
-                prob = float(preds[0][idx])
-                bar_width = int(prob * 100)
-                st.markdown(
-                    f"{rank}. **{name}** — {prob:.2%} "
-                    f"`{'█' * max(1, bar_width // 5)}{'░' * (20 - max(1, bar_width // 5))}`"
-                )
-        else:
-            st.warning("Classifier model not available.")
-
-    # ── Anomaly Detection ──
-    with col2:
-        st.subheader("🔥 Anomaly Detection")
-        if autoencoder is not None and threshold_info is not None:
-            # Select threshold
-            if threshold_mode == "strict":
-                active_threshold = threshold_info["threshold_strict"]
-            elif threshold_mode == "p99":
-                active_threshold = threshold_info["threshold_p99"]
-            elif threshold_mode == "p95":
-                active_threshold = threshold_info["threshold_p95"]
-            else:
-                active_threshold = custom_threshold or threshold_info["threshold_strict"]
-
-            error_map, binary_mask, max_error = compute_anomaly_map(
-                autoencoder, image_array, active_threshold
-            )
-
-            anomalous_pixels = int(np.sum(binary_mask))
-            total_pixels = binary_mask.size
-            anomaly_ratio = anomalous_pixels / total_pixels
-
-            is_anomalous = anomalous_pixels > 0
-
-            if is_anomalous:
-                st.error(
-                    f"⚠️ Anomaly detected! {anomalous_pixels:,} pixels "
-                    f"({anomaly_ratio:.2%}) exceed threshold."
-                )
-            else:
-                st.success("✅ No anomalous pixels detected (appears normal).")
-
-            st.metric("Max Pixel Error", f"{max_error:.6f}")
-            st.metric("Active Threshold", f"{active_threshold:.6f}")
-            st.metric("Anomalous Pixels", f"{anomalous_pixels:,} / {total_pixels:,}")
-
-            # Visualizations
-            gray_2d = (image_array[0, :, :, 0] * 255).astype(np.uint8)
-
-            # Heatmap overlay
-            if is_anomalous:
-                overlay = overlay_heatmap(gray_2d, error_map, binary_mask)
-                st.image(
-                    overlay,
-                    caption="Anomaly Overlay (red = anomalous pixels)",
-                    use_container_width=True,
-                )
-
-            # Raw error map
-            if error_map.max() > 0:
-                error_display = (error_map / error_map.max() * 255).astype(np.uint8)
-            else:
-                error_display = (error_map * 255).astype(np.uint8)
-            st.image(
-                error_display,
-                caption="Reconstruction Error Map",
-                use_container_width=True,
-            )
-
-            # Reconstruction
-            reconstructed = autoencoder.predict(image_array, verbose=0)
-            recon_display = (reconstructed[0, :, :, 0] * 255).astype(np.uint8)
-            st.image(
-                recon_display,
-                caption="Autoencoder Reconstruction",
-                use_container_width=True,
-            )
-        else:
-            st.warning("Anomaly detection model not available.")
+    request_id = st.session_state.get("request_id")
+    if request_id:
+        st.subheader("Request Tracking")
+        st.code(request_id)
+        _show_request_status(
+            request_id,
+            debug_mode=debug_mode,
+            refresh_interval_seconds=0.8,
+            threshold_info=threshold_info,
+        )
 
 
 if __name__ == "__main__":

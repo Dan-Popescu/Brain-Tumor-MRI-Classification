@@ -23,8 +23,10 @@ Pour mettre à jour un env déjà créé:
 scripts/bootstrap_conda.sh --update
 ```
 
-Le bootstrap force aussi le solver conda `classic` (sans modifier ta config globale)
+Le bootstrap force aussi le solver conda `classic` (sans modifier la config globale)
 pour éviter les erreurs locales liées à `libmamba`.
+Il installe aussi automatiquement les hooks conda du projet, y compris l'ajout de
+`src/` au `PYTHONPATH` à l'activation de l'environnement.
 
 3. Activer l'environnement:
 ```bash
@@ -119,6 +121,7 @@ scripts/bootstrap_conda.sh --name mri-brain-tumor-alice --update
   - `JAVA_HOME=$CONDA_PREFIX`
   - `PYSPARK_PYTHON=$CONDA_PREFIX/bin/python`
   - `PYSPARK_DRIVER_PYTHON=$CONDA_PREFIX/bin/python`
+  - `PYTHONPATH=<project_root>/src:$PYTHONPATH`
 
 ## Dépannage rapide
 
