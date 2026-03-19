@@ -5,7 +5,7 @@ output_artifacts_path: data/inference/results/current/artifacts
 inference_versions_registry_path: data/processed/inference_versions.parquet 
 
 app_name: mri-inference 
-master: local[] 
+master: local[1] 
 
 models:
   classifier_model_path: models/baseline_cnn/best.keras 
@@ -17,10 +17,9 @@ enabled_outputs:
   - anomaly_autoencoder
   # - gradcam
 
-write_visual_artifacts: false 
+write_visual_artifacts: true 
 top_k: 5 
 threshold_mode: strict 
 
 partitions: 1
 partition_by: []
-

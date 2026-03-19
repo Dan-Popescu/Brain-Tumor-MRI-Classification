@@ -236,7 +236,12 @@ def _build_model(
             tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
 
             # block 3
-            tf.keras.layers.Conv2D(128, (3, 3), activation="relu"),
+            tf.keras.layers.Conv2D(
+                128,
+                (3, 3),
+                activation="relu",
+                name="final_conv_features",
+            ),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.MaxPooling2D(pool_size=(2, 2)),
 
