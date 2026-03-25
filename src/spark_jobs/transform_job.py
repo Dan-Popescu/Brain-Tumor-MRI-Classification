@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
+import numpy as np
 from PIL import Image
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
@@ -60,6 +61,15 @@ def _parse_resize_strategy(value: Any) -> str:
     return strategy
 
 
+def _parse_foreground_threshold(value: Any) -> int:
+    threshold = as_int(value, "foreground_threshold", 12)
+    if not 0 <= threshold <= 255:
+        raise ValueError(
+            f"Invalid `foreground_threshold`: {threshold}. Expected an integer in [0, 255]."
+        )
+    return threshold
+
+
 def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
     target_width, target_height = _parse_target_size(config.get("target_size", [224, 224]))
     debug_export_n = as_positive_int_or_none(config.get("debug_export_n"), "debug_export_n")
@@ -92,6 +102,24 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         "resize_strategy": _parse_resize_strategy(config.get("resize_strategy")),
         "target_width": target_width,
         "target_height": target_height,
+        "foreground_crop_enabled": as_bool(
+            config.get("foreground_crop_enabled"),
+            "foreground_crop_enabled",
+            False,
+        ),
+        "foreground_mask_enabled": as_bool(
+            config.get("foreground_mask_enabled"),
+            "foreground_mask_enabled",
+            False,
+        ),
+        "intensity_normalization_enabled": as_bool(
+            config.get("intensity_normalization_enabled"),
+            "intensity_normalization_enabled",
+            False,
+        ),
+        "foreground_threshold": _parse_foreground_threshold(
+            config.get("foreground_threshold")
+        ),
         "debug_export_enabled": as_bool(
             config.get("debug_export_enabled"),
             "debug_export_enabled",
@@ -168,6 +196,151 @@ def _resize_image(
     return canvas
 
 
+def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    visited = np.zeros((height, width), dtype=bool)
+    stack: list[tuple[int, int]] = []
+
+    def _push_if_background(row: int, col: int) -> None:
+        if mask[row, col] or visited[row, col]:
+            return
+        visited[row, col] = True
+        stack.append((row, col))
+
+    for col in range(width):
+        _push_if_background(0, col)
+        _push_if_background(height - 1, col)
+    for row in range(height):
+        _push_if_background(row, 0)
+        _push_if_background(row, width - 1)
+
+    while stack:
+        row, col = stack.pop()
+        for row_offset, col_offset in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            next_row = row + row_offset
+            next_col = col + col_offset
+            if not (0 <= next_row < height and 0 <= next_col < width):
+                continue
+            if mask[next_row, next_col] or visited[next_row, next_col]:
+                continue
+            visited[next_row, next_col] = True
+            stack.append((next_row, next_col))
+
+    return mask | (~visited)
+
+
+def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    visited = np.zeros((height, width), dtype=bool)
+    largest_component: list[tuple[int, int]] = []
+
+    for start_row in range(height):
+        for start_col in range(width):
+            if not mask[start_row, start_col] or visited[start_row, start_col]:
+                continue
+
+            stack = [(start_row, start_col)]
+            component: list[tuple[int, int]] = []
+            visited[start_row, start_col] = True
+
+            while stack:
+                row, col = stack.pop()
+                component.append((row, col))
+
+                for row_offset, col_offset in (
+                    (-1, 0),
+                    (1, 0),
+                    (0, -1),
+                    (0, 1),
+                ):
+                    next_row = row + row_offset
+                    next_col = col + col_offset
+                    if not (0 <= next_row < height and 0 <= next_col < width):
+                        continue
+                    if not mask[next_row, next_col] or visited[next_row, next_col]:
+                        continue
+                    visited[next_row, next_col] = True
+                    stack.append((next_row, next_col))
+
+            if len(component) > len(largest_component):
+                largest_component = component
+
+    result = np.zeros_like(mask, dtype=bool)
+    for row, col in largest_component:
+        result[row, col] = True
+    return result
+
+
+def _extract_foreground_mask(
+    image_array: np.ndarray,
+    threshold: int,
+) -> np.ndarray | None:
+    foreground = image_array > float(threshold)
+    if not np.any(foreground):
+        return None
+
+    largest_component = _largest_connected_component(foreground)
+    if not np.any(largest_component):
+        return None
+    return _fill_mask_holes(largest_component)
+
+
+def _crop_to_foreground(
+    image_array: np.ndarray,
+    foreground_mask: np.ndarray,
+    margin_pixels: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    foreground_rows, foreground_cols = np.where(foreground_mask)
+    top = max(0, int(foreground_rows.min()) - margin_pixels)
+    bottom = min(image_array.shape[0], int(foreground_rows.max()) + margin_pixels + 1)
+    left = max(0, int(foreground_cols.min()) - margin_pixels)
+    right = min(image_array.shape[1], int(foreground_cols.max()) + margin_pixels + 1)
+    return (
+        image_array[top:bottom, left:right],
+        foreground_mask[top:bottom, left:right],
+    )
+
+
+def _normalize_intensity(
+    image_array: np.ndarray,
+    foreground_mask: np.ndarray | None,
+) -> np.ndarray:
+    values = image_array[foreground_mask] if foreground_mask is not None else image_array.reshape(-1)
+    if values.size == 0:
+        return image_array
+
+    low = float(np.percentile(values, 1))
+    high = float(np.percentile(values, 99))
+    if high <= low:
+        return image_array
+
+    normalized = np.clip((image_array - low) / (high - low), 0.0, 1.0) * 255.0
+    return normalized.astype(np.float32)
+
+
+def _prepare_grayscale_image(
+    gray_image: Image.Image,
+    settings: dict[str, Any],
+) -> Image.Image:
+    image_array = np.asarray(gray_image, dtype=np.float32)
+    foreground_mask = _extract_foreground_mask(
+        image_array,
+        int(settings["foreground_threshold"]),
+    )
+
+    if settings["foreground_crop_enabled"] and foreground_mask is not None:
+        image_array, foreground_mask = _crop_to_foreground(image_array, foreground_mask)
+
+    if settings["intensity_normalization_enabled"]:
+        image_array = _normalize_intensity(image_array, foreground_mask)
+
+    if settings["foreground_mask_enabled"] and foreground_mask is not None:
+        image_array = image_array.copy()
+        image_array[~foreground_mask] = 0.0
+
+    return Image.fromarray(np.clip(image_array, 0, 255).astype(np.uint8), mode="L")
+
+
 def _write_version_metadata(settings: dict[str, Any]) -> str:
     """Persist transform settings for traceability under images_silver/<version>/."""
     version_root = Path(settings["output_images_path"]) / settings["transform_version"]
@@ -179,6 +352,10 @@ def _write_version_metadata(settings: dict[str, Any]) -> str:
         "transform_version": settings["transform_version"],
         "target_size": [settings["target_width"], settings["target_height"]],
         "resize_strategy": settings["resize_strategy"],
+        "foreground_crop_enabled": settings["foreground_crop_enabled"],
+        "foreground_mask_enabled": settings["foreground_mask_enabled"],
+        "intensity_normalization_enabled": settings["intensity_normalization_enabled"],
+        "foreground_threshold": settings["foreground_threshold"],
         "image_mode": "L",
         "image_format": "PNG",
         "transform_backend": "pillow_map_partitions",
@@ -282,8 +459,9 @@ def _transform_partition(
         with Image.open(local_raw_path) as image:
             gray = image.convert("L")
             orig_w, orig_h = gray.size
+            prepared = _prepare_grayscale_image(gray, settings)
             transformed = _resize_image(
-                image=gray,
+                image=prepared,
                 target_width=target_width,
                 target_height=target_height,
                 strategy=resize_strategy,

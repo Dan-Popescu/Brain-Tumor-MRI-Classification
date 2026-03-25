@@ -16,10 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REQUESTS_ROOT = PROJECT_ROOT / "data" / "inference" / "requests"
 CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "models" / "baseline_cnn" / "best.keras"
 AUTOENCODER_MODEL_PATH = (
-    PROJECT_ROOT / "models" / "anomaly_autoencoder" / "best_autoencoder.keras"
+    PROJECT_ROOT / "models" / "anomaly_autoencoder_preprocessed" / "best_autoencoder.keras"
 )
 THRESHOLD_PATH = (
-    PROJECT_ROOT / "models" / "anomaly_autoencoder" / "anomaly_threshold.json"
+    PROJECT_ROOT / "models" / "anomaly_autoencoder_preprocessed" / "anomaly_threshold.json"
 )
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -90,6 +90,8 @@ def _artifact_path(request_dir: Path, first_prediction: dict[str, Any], key: str
         "reconstruction_path": f"{image_id}_reconstruction.png",
         "error_map_path": f"{image_id}_error_map.png",
         "anomaly_overlay_path": f"{image_id}_anomaly_overlay.png",
+        "gradcam_path": f"{image_id}_gradcam.png",
+        "gradcam_overlay_path": f"{image_id}_gradcam_overlay.png",
     }
     suffix = suffix_by_key.get(key)
     if suffix is None:
@@ -144,7 +146,11 @@ def _render_processing_indicator(status: dict[str, Any], current_state: str) -> 
         st.caption(f"Started at {started_at}")
 
 
-def _submit_request(uploaded_file, threshold_mode: str) -> str:
+def _submit_request(
+    uploaded_file,
+    threshold_mode: str,
+    custom_threshold: float | None = None,
+) -> str:
     request_id = _request_id()
     request_dir = _request_dir(request_id)
     raw_dir = request_dir / "raw"
@@ -154,19 +160,27 @@ def _submit_request(uploaded_file, threshold_mode: str) -> str:
     raw_path = raw_dir / filename
     raw_path.write_bytes(uploaded_file.getvalue())
 
+    metadata = {
+        "request_id": request_id,
+        "created_at": _utc_now_iso(),
+        "source": "streamlit_app_new",
+        "filename": filename,
+        "write_visual_artifacts": True,
+        "partitions": 1,
+        "partition_by": [],
+        "enabled_outputs": [
+            "classification", 
+            "anomaly_autoencoder", 
+            # "gradcam"
+        ],
+        "threshold_mode": threshold_mode,
+    }
+    if threshold_mode == "custom" and custom_threshold is not None:
+        metadata["custom_threshold"] = float(custom_threshold)
+
     _write_json(
         request_dir / "metadata.json",
-        {
-            "request_id": request_id,
-            "created_at": _utc_now_iso(),
-            "source": "streamlit_app_new",
-            "filename": filename,
-            "write_visual_artifacts": True,
-            "partitions": 1,
-            "partition_by": [],
-            "enabled_outputs": ["classification", "anomaly_autoencoder"],
-            "threshold_mode": threshold_mode,
-        },
+        metadata,
     )
     _write_json(
         request_dir / "status.json",
@@ -178,6 +192,10 @@ def _submit_request(uploaded_file, threshold_mode: str) -> str:
     )
 
     return request_id
+
+
+def _clear_active_request() -> None:
+    st.session_state.pop("request_id", None)
 
 
 def _show_request_status(
@@ -259,6 +277,36 @@ def _show_request_status(
             f"{rank}. **{name}** — {prob:.2%} "
             f"`{'█' * max(1, bar_width // 5)}{'░' * (20 - max(1, bar_width // 5))}`"
         )
+
+    gradcam_path = _artifact_path(
+        request_dir,
+        first_prediction,
+        "gradcam_path",
+    )
+    gradcam_overlay_path = _artifact_path(
+        request_dir,
+        first_prediction,
+        "gradcam_overlay_path",
+    )
+    if gradcam_path is not None or gradcam_overlay_path is not None:
+        st.subheader("Grad-CAM")
+        gradcam_col1, gradcam_col2 = st.columns(2)
+
+        with gradcam_col1:
+            if gradcam_path is not None:
+                st.image(
+                    Image.open(gradcam_path),
+                    caption="Grad-CAM",
+                    use_container_width=True,
+                )
+
+        with gradcam_col2:
+            if gradcam_overlay_path is not None:
+                st.image(
+                    Image.open(gradcam_overlay_path),
+                    caption="Grad-CAM Overlay",
+                    use_container_width=True,
+                )
 
     st.subheader("Anomaly Detection")
     is_anomalous = bool(first_prediction.get("anomaly_is_detected"))
@@ -377,14 +425,34 @@ def main() -> None:
 
     threshold_mode = st.sidebar.selectbox(
         "Anomaly Threshold",
-        ["strict", "p99", "p95"],
-        help="Threshold mode passed to the inference worker.",
+        ["strict", "p99", "p95", "custom"],
+        help=(
+            "**strict**: guarantees 0% false positives on normal scans. "
+            "**p99/p95**: slightly more sensitive. "
+            "**custom**: set your own value."
+        ),
+        key="threshold_mode_selector",
+        on_change=_clear_active_request,
     )
+    custom_threshold: float | None = None
+    if threshold_mode == "custom" and threshold_info is not None:
+        custom_threshold = st.sidebar.slider(
+            "Custom threshold",
+            min_value=0.0,
+            max_value=float(threshold_info["threshold_strict"]) * 2,
+            value=float(threshold_info["threshold_strict"]),
+            step=0.0001,
+            format="%.6f",
+            key="custom_threshold_slider",
+            on_change=_clear_active_request,
+        )
     debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 
     uploaded_file = st.file_uploader(
         "Upload an MRI image",
         type=["png", "jpg", "jpeg"],
+        key="uploaded_mri",
+        on_change=_clear_active_request,
     )
 
     if uploaded_file is not None:
@@ -392,7 +460,11 @@ def main() -> None:
         st.image(image, caption="Uploaded image", width=320)
 
     if st.button("Submit to worker", disabled=uploaded_file is None):
-        request_id = _submit_request(uploaded_file, threshold_mode)
+        request_id = _submit_request(
+            uploaded_file,
+            threshold_mode,
+            custom_threshold=custom_threshold,
+        )
         st.session_state["request_id"] = request_id
         st.rerun()
 

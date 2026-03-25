@@ -243,6 +243,7 @@ def _prepare_request_settings(
     for key in [
         "top_k",
         "threshold_mode",
+        "custom_threshold",
         "write_visual_artifacts",
         "master",
         "partitions",

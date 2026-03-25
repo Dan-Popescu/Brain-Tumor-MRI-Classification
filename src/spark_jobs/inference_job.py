@@ -8,6 +8,7 @@ from pyspark.sql import Row, SparkSession
 
 from spark_jobs.config_utils import (
     as_bool,
+    as_positive_float,
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
@@ -21,6 +22,11 @@ from inference.model_registry import (
 from inference.classification import decode_processed_bytes, predict_classifier
 from inference.anomaly_autoencoder import predict_anomaly
 from inference.artifacts import save_autoencoder_artifacts
+from inference.gradcam import compute_gradcam, save_gradcam_artifacts
+
+_CLASSIFIER_CACHE: dict[str, Any] = {}
+_AUTOENCODER_CACHE: dict[str, Any] = {}
+_THRESHOLD_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -40,6 +46,11 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
         "enabled_outputs": list(config.get("enabled_outputs", ["classification"])),
         "models": dict(config.get("models", {})),
         "threshold_mode": str(config.get("threshold_mode", "strict")),
+        "custom_threshold": (
+            as_positive_float(config.get("custom_threshold"), "custom_threshold", 1.0)
+            if config.get("custom_threshold") is not None
+            else None
+        ),
         "write_visual_artifacts": as_bool(
             config.get("write_visual_artifacts"),
             "write_visual_artifacts",
@@ -59,6 +70,30 @@ def _validate_input_manifest_columns(columns: list[str]) -> None:
         )
 
 
+def _get_classifier_model_cached(model_path: str) -> Any:
+    model = _CLASSIFIER_CACHE.get(model_path)
+    if model is None:
+        model = load_classifier_model(model_path)
+        _CLASSIFIER_CACHE[model_path] = model
+    return model
+
+
+def _get_autoencoder_model_cached(model_path: str) -> Any:
+    model = _AUTOENCODER_CACHE.get(model_path)
+    if model is None:
+        model = load_autoencoder_model(model_path)
+        _AUTOENCODER_CACHE[model_path] = model
+    return model
+
+
+def _get_autoencoder_threshold_cached(threshold_path: str) -> dict[str, Any]:
+    threshold_info = _THRESHOLD_CACHE.get(threshold_path)
+    if threshold_info is None:
+        threshold_info = load_autoencoder_threshold(threshold_path)
+        _THRESHOLD_CACHE[threshold_path] = threshold_info
+    return threshold_info
+
+
 def _predict_partition(
     rows: Iterable[Row],
     settings: dict[str, Any],
@@ -68,13 +103,15 @@ def _predict_partition(
     threshold_info = None
 
     if "classification" in settings["enabled_outputs"]:
-        classifier = load_classifier_model(settings["models"]["classifier_model_path"])
+        classifier = _get_classifier_model_cached(
+            settings["models"]["classifier_model_path"]
+        )
 
     if "anomaly_autoencoder" in settings["enabled_outputs"]:
-        autoencoder = load_autoencoder_model(
+        autoencoder = _get_autoencoder_model_cached(
             settings["models"]["autoencoder_model_path"]
         )
-        threshold_info = load_autoencoder_threshold(
+        threshold_info = _get_autoencoder_threshold_cached(
             settings["models"]["autoencoder_threshold_path"]
         )
 
@@ -115,6 +152,19 @@ def _predict_partition(
             result.update(
                 predict_classifier(classifier, image_array, top_k=settings["top_k"])
             )
+            if "gradcam" in settings["enabled_outputs"] and settings["output_artifacts_path"]:
+                gradcam_paths = save_gradcam_artifacts(
+                    output_artifacts_dir=settings["output_artifacts_path"],
+                    image_id=row["image_id"],
+                    image_array=image_array,
+                    heatmap=compute_gradcam(
+                        classifier,
+                        image_array,
+                        pred_index=result["classifier_pred_idx"],
+                    ),
+                )
+                result["gradcam_path"] = gradcam_paths["gradcam_path"]
+                result["gradcam_overlay_path"] = gradcam_paths["gradcam_overlay_path"]
 
         if autoencoder is not None and threshold_info is not None:
             anomaly = predict_anomaly(
@@ -122,6 +172,7 @@ def _predict_partition(
                 image_array,
                 threshold_info,
                 threshold_mode=settings["threshold_mode"],
+                custom_threshold=settings.get("custom_threshold"),
             )
             result["anomaly_max_error"] = anomaly["anomaly_max_error"]
             result["anomaly_threshold"] = anomaly["anomaly_threshold"]
@@ -136,11 +187,14 @@ def _predict_partition(
                 paths = save_autoencoder_artifacts(
                     output_artifacts_dir=settings["output_artifacts_path"],
                     image_id=row["image_id"],
+                    image_array=image_array,
                     autoencoder_reconstruction=anomaly["autoencoder_reconstruction"],
                     error_map=anomaly["error_map"],
+                    binary_mask=anomaly["binary_mask"],
                 )
                 result["reconstruction_path"] = paths["reconstruction_path"]
                 result["error_map_path"] = paths["error_map_path"]
+                result["anomaly_overlay_path"] = paths["anomaly_overlay_path"]
 
         yield tuple(result[field.name] for field in prediction_schema().fields)
 

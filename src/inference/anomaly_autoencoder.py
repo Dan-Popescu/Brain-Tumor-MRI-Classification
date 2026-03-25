@@ -9,9 +9,14 @@ def predict_anomaly(
         image_array: np.ndarray,
         threshold_info: dict[str, Any],
         threshold_mode: str = "strict",
+        custom_threshold: float | None = None,
 ) -> dict[str, Any]:
     
-    if threshold_mode == "p99":
+    if threshold_mode == "custom":
+        if custom_threshold is None:
+            raise ValueError("`custom_threshold` is required when threshold_mode='custom'.")
+        threshold = float(custom_threshold)
+    elif threshold_mode == "p99":
         threshold = float(threshold_info["threshold_p99"])
     elif threshold_mode == "p95":
         threshold = float(threshold_info["threshold_p95"])
