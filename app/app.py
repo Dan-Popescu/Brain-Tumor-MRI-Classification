@@ -16,10 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REQUESTS_ROOT = PROJECT_ROOT / "data" / "inference" / "requests"
 CLASSIFIER_MODEL_PATH = PROJECT_ROOT / "models" / "baseline_cnn" / "best.keras"
 AUTOENCODER_MODEL_PATH = (
-    PROJECT_ROOT / "models" / "anomaly_autoencoder" / "best_autoencoder.keras"
+    PROJECT_ROOT / "models" / "anomaly_autoencoder_preprocessed" / "best_autoencoder.keras"
 )
 THRESHOLD_PATH = (
-    PROJECT_ROOT / "models" / "anomaly_autoencoder" / "anomaly_threshold.json"
+    PROJECT_ROOT / "models" / "anomaly_autoencoder_preprocessed" / "anomaly_threshold.json"
 )
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
