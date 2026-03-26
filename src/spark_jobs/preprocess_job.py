@@ -144,7 +144,6 @@ def _enrich_manifest(df: DataFrame) -> DataFrame:
         )
         .withColumn("image_id", F.sha2(F.col("raw_path"), 256))
         .withColumn("file_size", F.col("length").cast("long"))
-        .withColumn("is_valid", F.lit(True))
     )
 
     label_mapping = _build_label_mapping(enriched)
@@ -158,7 +157,6 @@ def _enrich_manifest(df: DataFrame) -> DataFrame:
             "label_idx",
             "modality",
             "file_size",
-            "is_valid",
         )
     )
 

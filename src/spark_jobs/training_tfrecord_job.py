@@ -19,6 +19,10 @@ from config_utils import (
     load_config,
     parse_partition_columns,
 )
+from training.dataset_artifacts import (
+    DATASET_SUMMARY_FILENAME,
+    SHARD_MANIFEST_DIRNAME,
+)
 
 # from project_paths import PROJECT_ROOT
 # project_root = str(PROJECT_ROOT)
@@ -171,7 +175,7 @@ def _write_partition_tfrecords(
     partition_index: int,
     rows: Iterable[Any],
     output_local_root: str,
-) -> Iterator[tuple[str, int, int]]:
+) -> Iterator[tuple[str, int, str, int]]:
     import tensorflow as tf
 
     output_root = Path(output_local_root)
@@ -228,7 +232,22 @@ def _write_partition_tfrecords(
 
     for (split, shard_id), rows_written in counts.items():
         if rows_written > 0:
-            yield (split, shard_id, rows_written)
+            relative_path = str(
+                Path(f"split={split}") / f"shard_id={shard_id}" / f"part-{partition_index:05d}.tfrecord"
+            )
+            yield (split, shard_id, relative_path, rows_written)
+
+
+def _shard_manifest_schema() -> T.StructType:
+    return T.StructType(
+        [
+            T.StructField("export_id", T.StringType(), nullable=False),
+            T.StructField("split", T.StringType(), nullable=False),
+            T.StructField("shard_id", T.IntegerType(), nullable=False),
+            T.StructField("relative_path", T.StringType(), nullable=False),
+            T.StructField("rows_written", T.LongType(), nullable=False),
+        ]
+    )
 
 
 def _registry_schema() -> T.StructType:
@@ -303,6 +322,115 @@ def _upsert_training_tfrecord_registry(
     return registry_path
 
 
+def _collect_label_rows(manifest_df: DataFrame) -> list[dict[str, Any]]:
+    rows = (
+        manifest_df.select("label_idx", "pathology")
+        .where(F.col("label_idx").isNotNull())
+        .distinct()
+        .orderBy("label_idx")
+        .collect()
+    )
+    return [
+        {
+            "label_idx": int(row["label_idx"]),
+            "pathology": None if row["pathology"] is None else str(row["pathology"]),
+        }
+        for row in rows
+    ]
+
+
+def _collect_label_counts_by_split(manifest_df: DataFrame) -> dict[str, dict[str, int]]:
+    rows = (
+        manifest_df.groupBy("split", "label_idx")
+        .count()
+        .where(F.col("label_idx").isNotNull())
+        .collect()
+    )
+    result: dict[str, dict[str, int]] = {"train": {}, "val": {}, "test": {}}
+    for row in rows:
+        split = str(row["split"])
+        if split not in result:
+            result[split] = {}
+        result[split][str(int(row["label_idx"]))] = int(row["count"])
+    return result
+
+
+def _collect_image_spec(manifest_df: DataFrame) -> dict[str, int] | None:
+    required_columns = {"new_height", "new_width", "channels"}
+    if not required_columns.issubset(manifest_df.columns):
+        return None
+
+    specs = (
+        manifest_df.select("new_height", "new_width", "channels")
+        .distinct()
+        .collect()
+    )
+    if len(specs) != 1:
+        return None
+
+    row = specs[0]
+    return {
+        "image_height": int(row["new_height"]),
+        "image_width": int(row["new_width"]),
+        "channels": int(row["channels"]),
+    }
+
+
+def _write_dataset_summary(
+    *,
+    local_output_path: Path,
+    settings: dict[str, Any],
+    rows_by_split: dict[str, int],
+    file_counts_by_split: dict[str, int],
+    distinct_labels: int,
+    label_rows: list[dict[str, Any]],
+    label_counts_by_split: dict[str, dict[str, int]],
+    image_spec: dict[str, int] | None,
+) -> str:
+    summary_payload: dict[str, Any] = {
+        "export_id": settings["export_id"],
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": settings["seed"],
+        "n_shards": settings["n_shards"],
+        "rows_total": int(
+            rows_by_split.get("train", 0)
+            + rows_by_split.get("val", 0)
+            + rows_by_split.get("test", 0)
+        ),
+        "rows_by_split": {
+            "train": int(rows_by_split.get("train", 0)),
+            "val": int(rows_by_split.get("val", 0)),
+            "test": int(rows_by_split.get("test", 0)),
+        },
+        "files_total": int(
+            file_counts_by_split.get("train", 0)
+            + file_counts_by_split.get("val", 0)
+            + file_counts_by_split.get("test", 0)
+        ),
+        "files_by_split": {
+            "train": int(file_counts_by_split.get("train", 0)),
+            "val": int(file_counts_by_split.get("val", 0)),
+            "test": int(file_counts_by_split.get("test", 0)),
+        },
+        "distinct_labels": int(distinct_labels),
+        "labels": label_rows,
+        "label_counts_by_split": label_counts_by_split,
+        "input_manifest_path": settings["input_manifest_path"],
+        "output_path": settings["output_path"],
+        "current_output_path": settings["current_output_path"],
+        "shard_manifest_path": str(local_output_path / SHARD_MANIFEST_DIRNAME),
+        "dataset_summary_path": str(local_output_path / DATASET_SUMMARY_FILENAME),
+        "output_format": settings["output_format"],
+        "compression": settings["compression"],
+    }
+    if image_spec is not None:
+        summary_payload.update(image_spec)
+
+    summary_path = local_output_path / DATASET_SUMMARY_FILENAME
+    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    return str(summary_path)
+
+
 def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
     """Run TFRecord export pipeline from normalized or partial settings."""
     resolved_settings = _resolve_settings(settings)
@@ -320,6 +448,9 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     rows_by_split_input = {row["split"]: int(row["count"]) for row in input_counts_rows}
     rows_input_total = int(sum(rows_by_split_input.values()))
     distinct_labels = int(manifest_df.select("label_idx").distinct().count())
+    label_rows = _collect_label_rows(manifest_df)
+    label_counts_by_split = _collect_label_counts_by_split(manifest_df)
+    image_spec = _collect_image_spec(manifest_df)
 
     partition_by = resolved_settings["partition_by"]
     if partition_by:
@@ -357,8 +488,8 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
 
     write_counts_df = spark.createDataFrame(
         write_counts_rdd,
-        "split string, shard_id int, rows_written long"
-    )
+        "split string, shard_id int, relative_path string, rows_written long"
+    ).withColumn("export_id", F.lit(resolved_settings["export_id"]))
 
     input_counts_df = (
         manifest_df.groupBy("split")
@@ -383,12 +514,42 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     # After a successful mismatch check, output counts are identical to input counts.
     rows_by_split_written = dict(rows_by_split_input)
     rows_written_total = int(rows_input_total)
+    file_counts_by_split_rows = (
+        write_counts_df.groupBy("split").count().collect()
+    )
+    file_counts_by_split = {
+        row["split"]: int(row["count"]) for row in file_counts_by_split_rows
+    }
+
+    shard_manifest_output_path = local_output_path / SHARD_MANIFEST_DIRNAME
+    (
+        write_counts_df.select(
+            "export_id",
+            "split",
+            "shard_id",
+            "relative_path",
+            "rows_written",
+        )
+        .coalesce(1)
+        .write.mode("overwrite")
+        .parquet(str(shard_manifest_output_path))
+    )
 
     local_current_path = _to_abs_local_path(
         resolved_settings["current_output_path"], project_root
     )
     if local_current_path.resolve() == local_output_path.resolve():
         raise ValueError("`current_output_path` must be different from `output_path`.")
+    dataset_summary_path = _write_dataset_summary(
+        local_output_path=local_output_path,
+        settings=resolved_settings,
+        rows_by_split=rows_by_split_written,
+        file_counts_by_split=file_counts_by_split,
+        distinct_labels=distinct_labels,
+        label_rows=label_rows,
+        label_counts_by_split=label_counts_by_split,
+        image_spec=image_spec,
+    )
     _refresh_current_alias(local_output_path, local_current_path)
 
     registry_path = _upsert_training_tfrecord_registry(
@@ -407,6 +568,8 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
         "distinct_labels": int(distinct_labels),
         "output_path": resolved_settings["output_path"],
         "output_current_path": resolved_settings["current_output_path"],
+        "shard_manifest_path": str(shard_manifest_output_path),
+        "dataset_summary_path": dataset_summary_path,
         "output_registry_path": registry_path,
     }
 
@@ -431,6 +594,8 @@ def main() -> None:
     print(f"[training_tfrecord_job] distinct labels: {result['distinct_labels']}")
     print(f"[training_tfrecord_job] output path: {result['output_path']}")
     print(f"[training_tfrecord_job] output current path: {result['output_current_path']}")
+    print(f"[training_tfrecord_job] shard manifest: {result['shard_manifest_path']}")
+    print(f"[training_tfrecord_job] dataset summary: {result['dataset_summary_path']}")
     print(f"[training_tfrecord_job] output registry: {result['output_registry_path']}")
 
     spark.stop()

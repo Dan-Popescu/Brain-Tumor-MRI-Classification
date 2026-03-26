@@ -130,7 +130,6 @@ def _single_image_bronze_schema() -> T.StructType:
             T.StructField("label_idx", T.IntegerType(), nullable=True),
             T.StructField("modality", T.StringType(), nullable=True),
             T.StructField("file_size", T.LongType(), nullable=True),
-            T.StructField("is_valid", T.BooleanType(), nullable=True),
         ]
     )
 
@@ -155,7 +154,6 @@ def _write_single_image_bronze_manifest(
         None,
         None,
         file_size,
-        True,
     )
 
     (

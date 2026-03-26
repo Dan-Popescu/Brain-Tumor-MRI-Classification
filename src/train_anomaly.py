@@ -15,7 +15,13 @@ from spark_jobs.config_utils import (
     as_positive_int,
     as_positive_int_or_none,
     load_config,
-    resolve_local_path,
+)
+from training.dataset_artifacts import (
+    get_label_count,
+    load_dataset_summary,
+    load_split_files,
+    lookup_label_idx,
+    resolve_dataset_artifact_paths,
 )
 
 
@@ -41,15 +47,6 @@ def _parse_image_size(value: Any) -> tuple[int, int]:
     ):
         raise ValueError("`image_size` must be [height, width] with positive ints.")
     return int(value[0]), int(value[1])
-
-
-def _to_abs_local_path(path: str) -> Path:
-    local = Path(resolve_local_path(path))
-    if local.is_absolute():
-        return local
-    return (Path.cwd() / local).resolve()
-
-
 def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
     image_height, image_width = _parse_image_size(
         config.get("image_size", [224, 224])
@@ -145,77 +142,45 @@ def _parse_tfrecord_autoencoder(
 
 
 # ── File collection ──────────────────────────────────────────────────────────
-
-
-def _collect_split_files(
+def _load_dataset_inputs(
     input_tfrecord_path: str,
-) -> tuple[Path, dict[str, list[str]]]:
-    root = _to_abs_local_path(input_tfrecord_path)
+) -> tuple[Path, dict[str, list[str]], dict[str, Any]]:
+    root, shard_manifest_path, summary_path = resolve_dataset_artifact_paths(
+        input_tfrecord_path
+    )
     if not root.exists():
         raise FileNotFoundError(f"TFRecord root not found: {root}")
 
-    split_files: dict[str, list[str]] = {"train": [], "val": [], "test": []}
-    for split_name in split_files:
-        split_dir = root / f"split={split_name}"
-        if split_dir.is_dir():
-            files = sorted(str(p) for p in split_dir.rglob("*.tfrecord"))
-            split_files[split_name] = files
-    return root, split_files
+    split_files = load_split_files(root, shard_manifest_path)
+    dataset_summary = load_dataset_summary(summary_path)
+    return root, split_files, dataset_summary
 
 
 # ── Normal-only filtering ────────────────────────────────────────────────────
 
 
 def _detect_normal_label_idx(
-    split_files: dict[str, list[str]],
     normal_label_idx: int | None,
     normal_label_name: str,
+    dataset_summary: dict[str, Any],
 ) -> int:
-    """Return the label_idx corresponding to normal scans.
-
-    If ``normal_label_idx`` is explicitly provided, use it directly.
-    Otherwise scan a sample of train records and look for the label_idx
-    that appears alongside the ``_NORMAL`` class. Since the preprocessing
-    pipeline assigns ``label_idx`` deterministically by alphabetical order
-    of pathology names, ``_NORMAL`` (with leading underscore) consistently
-    gets the highest index.  As a fallback we scan and pick the most
-    frequent label in the first 500 records (the caller should set
-    ``normal_label_idx`` explicitly in config if this heuristic fails).
-    """
+    """Return the label_idx corresponding to normal scans."""
     if normal_label_idx is not None:
         return int(normal_label_idx)
 
-    # Scan a sample to discover normal label
-    # In the preprocessing pipeline, _NORMAL sorts last alphabetically
-    # among the 15 pathologies, so label_idx should be 14 (0-indexed from
-    # the sorted list produced by _build_label_mapping).
-    # We still scan to be safe.
-    files = split_files.get("train", [])
-    if not files:
-        raise ValueError(
-            "No train files found – cannot auto-detect normal label_idx."
+    summary_label_idx = lookup_label_idx(dataset_summary, normal_label_name)
+    if summary_label_idx is not None:
+        print(
+            f"[anomaly] resolved normal_label_idx={summary_label_idx} "
+            f"from dataset summary for '{normal_label_name}'"
         )
+        return summary_label_idx
 
-    label_counts: dict[int, int] = {}
-    dataset = tf.data.TFRecordDataset(files[:4])
-    for raw_record in dataset.take(500):
-        example = tf.train.Example()
-        example.ParseFromString(raw_record.numpy())
-        feat = example.features.feature.get("label_idx")
-        if feat and feat.int64_list.value:
-            idx = int(feat.int64_list.value[0])
-            label_counts[idx] = label_counts.get(idx, 0) + 1
-
-    if not label_counts:
-        raise ValueError("Could not read any label_idx from train TFRecords.")
-
-    # Pick the highest label_idx (alphabetical: _NORMAL sorts last)
-    normal_idx = max(label_counts.keys())
-    print(
-        f"[anomaly] auto-detected normal_label_idx={normal_idx} "
-        f"(most likely '{normal_label_name}')"
+    raise ValueError(
+        "Could not resolve `normal_label_idx` from dataset_summary.json. "
+        "Provide `normal_label_idx` explicitly or ensure the summary contains "
+        f"the pathology '{normal_label_name}'."
     )
-    return normal_idx
 
 
 def _build_normal_only_dataset(
@@ -228,6 +193,7 @@ def _build_normal_only_dataset(
     seed: int,
     shuffle: bool,
     repeat: bool,
+    known_normal_count: int,
 ) -> tuple[tf.data.Dataset, int]:
     """Build a dataset containing only normal scans (autoencoder target=input).
 
@@ -236,31 +202,8 @@ def _build_normal_only_dataset(
     if not files:
         raise ValueError("No files provided for normal-only dataset.")
 
-    file_ds = tf.data.Dataset.from_tensor_slices(files)
-    if shuffle:
-        file_ds = file_ds.shuffle(
-            buffer_size=max(1, len(files)),
-            reshuffle_each_iteration=True,
-            seed=seed,
-        )
-
     cycle_length = min(16, max(1, len(files)))
-    raw_ds = file_ds.interleave(
-        lambda path: tf.data.TFRecordDataset(path),
-        cycle_length=cycle_length,
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=not shuffle,
-    )
-
-    # Count normal examples first (full scan – needed for steps_per_epoch)
-    normal_count = 0
-    for raw_record in raw_ds:
-        example = tf.train.Example()
-        example.ParseFromString(raw_record.numpy())
-        feat = example.features.feature.get("label_idx")
-        if feat and feat.int64_list.value:
-            if int(feat.int64_list.value[0]) == normal_label_idx:
-                normal_count += 1
+    normal_count = int(known_normal_count)
 
     # Rebuild dataset pipeline with filter
     file_ds2 = tf.data.Dataset.from_tensor_slices(files)
@@ -309,7 +252,7 @@ def _build_normal_only_dataset(
         normal_ds = normal_ds.repeat()
 
     normal_ds = normal_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return normal_ds, normal_count
+    return normal_ds, int(normal_count)
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -454,15 +397,38 @@ def run_anomaly_training(settings: dict[str, Any]) -> dict[str, Any]:
     resolved = _resolve_settings(settings)
     tf.keras.utils.set_random_seed(resolved["seed"])
 
-    tfrecord_root, split_files = _collect_split_files(resolved["input_tfrecord_path"])
+    tfrecord_root, split_files, dataset_summary = _load_dataset_inputs(
+        resolved["input_tfrecord_path"]
+    )
 
     # Detect which label_idx corresponds to normal
     normal_label_idx = _detect_normal_label_idx(
-        split_files,
         resolved.get("normal_label_idx"),
         resolved["normal_label_name"],
+        dataset_summary,
     )
     resolved["normal_label_idx"] = normal_label_idx
+
+    train_normal_count = get_label_count(
+        dataset_summary,
+        split="train",
+        label_idx=normal_label_idx,
+    )
+    val_normal_count = get_label_count(
+        dataset_summary,
+        split="val",
+        label_idx=normal_label_idx,
+    )
+    if train_normal_count is None:
+        raise ValueError(
+            "Missing normal label counts for train split in dataset_summary.json."
+        )
+    if split_files["val"] and val_normal_count is None:
+        raise ValueError(
+            "Missing normal label counts for val split in dataset_summary.json."
+        )
+    if val_normal_count is None:
+        val_normal_count = 0
 
     # ── Training dataset (normal only, train split) ──
     train_ds, num_train_normal = _build_normal_only_dataset(
@@ -475,6 +441,7 @@ def run_anomaly_training(settings: dict[str, Any]) -> dict[str, Any]:
         seed=resolved["seed"],
         shuffle=True,
         repeat=True,
+        known_normal_count=train_normal_count,
     )
     print(f"[anomaly] normal training examples: {num_train_normal}")
     if num_train_normal == 0:
@@ -494,6 +461,7 @@ def run_anomaly_training(settings: dict[str, Any]) -> dict[str, Any]:
             seed=resolved["seed"],
             shuffle=False,
             repeat=False,
+            known_normal_count=val_normal_count,
         )
         print(f"[anomaly] normal validation examples: {num_val_normal}")
 
@@ -563,6 +531,7 @@ def run_anomaly_training(settings: dict[str, Any]) -> dict[str, Any]:
         seed=resolved["seed"],
         shuffle=False,
         repeat=False,
+        known_normal_count=int(train_normal_count) + int(val_normal_count),
     )
 
     # Load best model for threshold calibration
@@ -587,6 +556,7 @@ def run_anomaly_training(settings: dict[str, Any]) -> dict[str, Any]:
     # ── Summary ──
     summary = {
         "settings": resolved,
+        "dataset_summary_used": True,
         "normal_label_idx": normal_label_idx,
         "num_train_normal": num_train_normal,
         "num_val_normal": num_val_normal,

@@ -453,7 +453,6 @@ def _transform_partition(
         label_idx = row["label_idx"]
         modality = row["modality"]
         file_size = row["file_size"]
-        is_valid = row["is_valid"]
 
         local_raw_path = _resolve_local_path(raw_path)
         with Image.open(local_raw_path) as image:
@@ -478,7 +477,6 @@ def _transform_partition(
             label_idx,
             modality,
             file_size,
-            is_valid,
             png_bytes,
             len(png_bytes),
             int(orig_w),
@@ -499,7 +497,6 @@ def _output_schema() -> T.StructType:
             T.StructField("label_idx", T.IntegerType(), nullable=True),
             T.StructField("modality", T.StringType(), nullable=True),
             T.StructField("file_size", T.LongType(), nullable=True),
-            T.StructField("is_valid", T.BooleanType(), nullable=True),
             T.StructField("processed_bytes", T.BinaryType(), nullable=False),
             T.StructField("processed_file_size", T.LongType(), nullable=False),
             T.StructField("orig_width", T.IntegerType(), nullable=False),
@@ -524,7 +521,6 @@ def _build_transform_df(
         "label_idx",
         "modality",
         "file_size",
-        "is_valid",
     }
     missing = sorted(required_columns - set(manifest_df.columns))
     if missing:
@@ -539,7 +535,6 @@ def _build_transform_df(
         "label_idx",
         "modality",
         "file_size",
-        "is_valid",
     )
 
     transformed_rdd = base_df.rdd.mapPartitions(
