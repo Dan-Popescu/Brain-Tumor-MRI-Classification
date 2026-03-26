@@ -295,7 +295,7 @@ def _upsert_training_tfrecord_registry(
     )
 
     conf_key = "spark.sql.sources.partitionOverwriteMode"
-    previous_overwrite_mode = spark.conf.get(conf_key, "static")
+    previous_overwrite_mode = spark.conf.get(conf_key, "static") or "static"
     spark.conf.set(conf_key, "dynamic")
     try:
         (

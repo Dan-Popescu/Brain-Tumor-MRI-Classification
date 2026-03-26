@@ -192,10 +192,11 @@ def _upsert_split_registry(
     settings: dict[str, Any],
     split_counts: dict[str, int],
 ) -> str:
-    registry_path = settings["split_versions_registry_path"]
 
     rows_total = int(
-        split_counts.get("train", 0) + split_counts.get("val", 0) + split_counts.get("test", 0)
+        split_counts.get("train", 0) 
+        + split_counts.get("val", 0) 
+        + split_counts.get("test", 0)
     )
     new_row = (
         settings["split_id"],
@@ -215,19 +216,17 @@ def _upsert_split_registry(
         settings["partitions"],
         settings["shuffle_partitions"],
     )
-    conf_key = "spark.sql.sources.partitionOverwriteMode"
-    previous_overwrite_mode = spark.conf.get(conf_key, "static") or "static"
-    spark.conf.set(conf_key, "dynamic")
-    try:
-        (
-            spark.createDataFrame([new_row], schema=_registry_schema())
-            .write.mode("overwrite")
-            .partitionBy("split_id")
-            .parquet(registry_path)
-        )
-    finally:
-        spark.conf.set(conf_key, previous_overwrite_mode)
+
+    registry_path = settings["split_versions_registry_path"]
+    
+    (
+        spark.createDataFrame([new_row], schema=_registry_schema())
+        .write.mode("append")
+        .parquet(registry_path)
+    )
+
     return registry_path
+
 
 
 def run_split(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
