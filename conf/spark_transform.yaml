@@ -11,6 +11,11 @@ target_size: [224, 224]
 resize_strategy: keep_aspect_pad
 transform_version: v1
 
+foreground_crop_enabled: true
+foreground_mask_enabled: true
+intensity_normalization_enabled: true
+foreground_threshold: 12
+
 # optional visual debug export (small sample only)
 debug_export_enabled: true
 debug_export_path: data/debug/transform_preview
