@@ -8,16 +8,22 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
-from urllib.parse import unquote, urlparse
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
-from config_utils import (
+from spark_jobs.config_utils import (
     as_int,
     as_positive_int,
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
+    to_abs_local_path,
+)
+from spark_jobs.spark_df_utils import (
+    build_spark_session,
+    configure_shuffle_partitions,
+    repartition_dataframe,
+    verify_partition_columns,
 )
 from training.dataset_artifacts import (
     DATASET_SUMMARY_FILENAME,
@@ -132,25 +138,6 @@ def _build_tfrecord_df(manifest_df: DataFrame, settings: dict[str, Any]) -> Data
         .withColumn("shard_seed", F.lit(settings["seed"]).cast("int"))
         .withColumn("n_shards", F.lit(n_shards).cast("int"))
     )
-
-
-def _resolve_local_path(path: str) -> str:
-    if path.startswith("file:"):
-        parsed = urlparse(path)
-        if parsed.scheme == "file":
-            if parsed.netloc:
-                return unquote(f"//{parsed.netloc}{parsed.path}")
-            return unquote(parsed.path or path[len("file:") :])
-    return path
-
-
-def _to_abs_local_path(path: str, project_root: str) -> Path:
-    local_path = Path(_resolve_local_path(path))
-    if local_path.is_absolute():
-        return local_path
-    return Path(project_root) / local_path
-
-
 def _prepare_output_dir(local_output_path: Path) -> None:
     resolved = local_output_path.resolve()
     if resolved == resolved.parent:
@@ -435,11 +422,10 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     """Run TFRecord export pipeline from normalized or partial settings."""
     resolved_settings = _resolve_settings(settings)
 
-    if resolved_settings["shuffle_partitions"]:
-        spark.conf.set(
-            "spark.sql.shuffle.partitions",
-            resolved_settings["shuffle_partitions"],
-        )
+    configure_shuffle_partitions(
+        spark,
+        resolved_settings["shuffle_partitions"],
+    )
 
     manifest_df = spark.read.parquet(resolved_settings["input_manifest_path"])
     tfrecord_df = _build_tfrecord_df(manifest_df, resolved_settings)
@@ -453,28 +439,14 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
     image_spec = _collect_image_spec(manifest_df)
 
     partition_by = resolved_settings["partition_by"]
-    if partition_by:
-        unknown = [col for col in partition_by if col not in tfrecord_df.columns]
-        if unknown:
-            raise ValueError(
-                "Unknown partition columns: "
-                + ", ".join(unknown)
-                + ". Available columns: "
-                + ", ".join(tfrecord_df.columns)
-            )
+    verify_partition_columns(tfrecord_df, partition_by)
+    tfrecord_df = repartition_dataframe(
+        tfrecord_df,
+        resolved_settings["partitions"],
+        partition_by,
+    )
 
-    if resolved_settings["partitions"]:
-        if partition_by:
-            tfrecord_df = tfrecord_df.repartition(
-                resolved_settings["partitions"], *partition_by
-            )
-        else:
-            tfrecord_df = tfrecord_df.repartition(resolved_settings["partitions"])
-    elif partition_by:
-        tfrecord_df = tfrecord_df.repartition(*partition_by)
-
-    project_root = str(Path.cwd().resolve())
-    local_output_path = _to_abs_local_path(resolved_settings["output_path"], project_root)
+    local_output_path = to_abs_local_path(resolved_settings["output_path"])
     _prepare_output_dir(local_output_path)
 
     # execute once for each partition
@@ -535,9 +507,7 @@ def run_training_tfrecord(spark: SparkSession, settings: dict[str, Any]) -> dict
         .parquet(str(shard_manifest_output_path))
     )
 
-    local_current_path = _to_abs_local_path(
-        resolved_settings["current_output_path"], project_root
-    )
+    local_current_path = to_abs_local_path(resolved_settings["current_output_path"])
     if local_current_path.resolve() == local_output_path.resolve():
         raise ValueError("`current_output_path` must be different from `output_path`.")
     dataset_summary_path = _write_dataset_summary(
@@ -578,10 +548,7 @@ def main() -> None:
     args = _parse_args()
     settings = load_settings(args.config)
 
-    spark_builder = SparkSession.builder.appName(settings["app_name"])
-    if settings["master"]:
-        spark_builder = spark_builder.master(settings["master"])
-    spark = spark_builder.getOrCreate()
+    spark = build_spark_session(settings["app_name"], settings["master"])
 
     result = run_training_tfrecord(spark, settings)
 

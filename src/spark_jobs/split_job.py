@@ -10,11 +10,18 @@ from typing import Any
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
-from config_utils import (
+from spark_jobs.config_utils import (
     as_int,
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
+)
+from spark_jobs.spark_df_utils import (
+    build_spark_session,
+    configure_shuffle_partitions,
+    repartition_dataframe,
+    verify_partition_columns,
+    write_partitioned_parquet,
 )
 
 
@@ -142,8 +149,6 @@ def _build_split_df(manifest_df: DataFrame, settings: dict[str, Any]) -> DataFra
     )
 
 
-    
-
     return (
         manifest_df.withColumn("__split_key", random_key)
         .withColumn(
@@ -229,44 +234,32 @@ def run_split(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
     """Run split pipeline from normalized or partial settings."""
     resolved_settings = _resolve_settings(settings)
 
-    if resolved_settings["shuffle_partitions"]:
-        spark.conf.set(
-            "spark.sql.shuffle.partitions",
-            resolved_settings["shuffle_partitions"],
-        )
+    configure_shuffle_partitions(
+        spark,
+        resolved_settings["shuffle_partitions"],
+    )
 
     manifest_df = spark.read.parquet(resolved_settings["input_manifest_path"])
     split_df = _build_split_df(manifest_df, resolved_settings)
 
     partition_by = resolved_settings["partition_by"]
-    if partition_by:
-        unknown = [col for col in partition_by if col not in split_df.columns]
-        if unknown:
-            raise ValueError(
-                "Unknown partition columns: "
-                + ", ".join(unknown)
-                + ". Available columns: "
-                + ", ".join(split_df.columns)
-            )
+    verify_partition_columns(split_df, partition_by)
+    split_df = repartition_dataframe(
+        split_df,
+        resolved_settings["partitions"],
+        partition_by,
+    )
 
-    if resolved_settings["partitions"]:
-        if partition_by:
-            split_df = split_df.repartition(
-                resolved_settings["partitions"], *partition_by
-            )
-        else:
-            split_df = split_df.repartition(resolved_settings["partitions"])
-    elif partition_by:
-        split_df = split_df.repartition(*partition_by)
-
-    writer = split_df.write.mode("overwrite")
-    if partition_by:
-        writer = writer.partitionBy(*partition_by)
-    writer.parquet(resolved_settings["output_manifest_path"])
-    current_writer = split_df.write.mode("overwrite")
-    if partition_by:
-        current_writer = current_writer.partitionBy(*partition_by)
-    current_writer.parquet(resolved_settings["current_output_manifest_path"])
+    write_partitioned_parquet(
+        split_df,
+        resolved_settings["output_manifest_path"],
+        partition_by,
+    )
+    write_partitioned_parquet(
+        split_df,
+        resolved_settings["current_output_manifest_path"],
+        partition_by,
+    )
 
     split_counts_rows = split_df.groupBy("split").count().collect()
     split_counts = {row["split"]: int(row["count"]) for row in split_counts_rows}
@@ -292,10 +285,7 @@ def main() -> None:
     args = _parse_args()
     settings = load_settings(args.config)
 
-    spark_builder = SparkSession.builder.appName(settings["app_name"])
-    if settings["master"]:
-        spark_builder = spark_builder.master(settings["master"])
-    spark = spark_builder.getOrCreate()
+    spark = build_spark_session(settings["app_name"], settings["master"])
 
     result = run_split(spark, settings)
 

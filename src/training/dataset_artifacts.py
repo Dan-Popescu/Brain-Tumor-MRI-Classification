@@ -6,19 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from spark_jobs.config_utils import resolve_local_path
+from spark_jobs.config_utils import to_abs_local_path
 
 SHARD_MANIFEST_DIRNAME = "shard_manifest.parquet"
 DATASET_SUMMARY_FILENAME = "dataset_summary.json"
-
-
-def to_abs_local_path(path: str) -> Path:
-    local = Path(resolve_local_path(path))
-    if local.is_absolute():
-        return local
-    return (Path.cwd() / local).resolve()
-
-
 def resolve_dataset_artifact_paths(input_tfrecord_path: str) -> tuple[Path, Path, Path]:
     root = to_abs_local_path(input_tfrecord_path)
     return (

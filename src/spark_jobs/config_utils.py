@@ -115,3 +115,11 @@ def resolve_local_path(path: str) -> str:
                 return unquote(f"//{parsed.netloc}{parsed.path}")
             return unquote(parsed.path or path[len("file:") :])
     return path
+
+
+def to_abs_local_path(path: str, base_dir: Path | None = None) -> Path:
+    """Resolve a config/local path to an absolute filesystem path."""
+    local = Path(resolve_local_path(path))
+    if local.is_absolute():
+        return local
+    return ((base_dir or Path.cwd()) / local).resolve()

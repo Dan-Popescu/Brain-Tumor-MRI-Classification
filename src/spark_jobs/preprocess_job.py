@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Any, cast
 
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
@@ -14,7 +13,14 @@ from spark_jobs.config_utils import (
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
-    resolve_local_path,
+    to_abs_local_path,
+)
+from spark_jobs.spark_df_utils import (
+    build_spark_session,
+    configure_shuffle_partitions,
+    repartition_dataframe,
+    verify_partition_columns,
+    write_partitioned_parquet,
 )
 
 
@@ -56,21 +62,13 @@ def load_settings(config_path: str | None = "conf/spark_preprocess.yaml") -> dic
     """Load and normalize settings from config file."""
     return _resolve_settings(load_config(config_path))
 
-
-def _to_abs_local_path(path: str) -> Path:
-    local = Path(resolve_local_path(path))
-    if local.is_absolute():
-        return local
-    return (Path.cwd() / local).resolve()
-
-
 def _resolve_binary_input_paths(input_path: str) -> list[str]:
     """Resolve top-level class directories as explicit binaryFile inputs.
 
     Passing explicit class directories allows Spark to read folders like `_NORMAL ...`
     while still keeping file listing and decoding distributed.
     """
-    local_root = _to_abs_local_path(input_path)
+    local_root = to_abs_local_path(input_path)
     if not local_root.exists():
         raise FileNotFoundError(f"Input path not found: {local_root}")
     if not local_root.is_dir():
@@ -164,11 +162,10 @@ def _enrich_manifest(df: DataFrame) -> DataFrame:
 def run_preprocess(spark: SparkSession, settings: dict[str, Any]) -> dict[str, Any]:
     """Run the preprocess pipeline from normalized or partial settings."""
     resolved_settings = _resolve_settings(settings)
-    if resolved_settings["shuffle_partitions"]:
-        spark.conf.set(
-            "spark.sql.shuffle.partitions",
-            resolved_settings["shuffle_partitions"],
-        )
+    configure_shuffle_partitions(
+        spark,
+        resolved_settings["shuffle_partitions"],
+    )
 
     input_df = _build_base_df(
         spark,
@@ -177,23 +174,12 @@ def run_preprocess(spark: SparkSession, settings: dict[str, Any]) -> dict[str, A
     manifest_df = _enrich_manifest(input_df)
 
     partition_by = resolved_settings["partition_by"]
-    if partition_by:
-        missing_partition_cols = [col for col in partition_by if col not in manifest_df.columns]
-        if missing_partition_cols:
-            raise ValueError(
-                "Unknown partition columns: "
-                + ", ".join(missing_partition_cols)
-                + ". Available columns: "
-                + ", ".join(manifest_df.columns)
-            )
-
-    if resolved_settings["partitions"]:
-        if partition_by:
-            manifest_df = manifest_df.repartition(resolved_settings["partitions"], *partition_by)
-        else:
-            manifest_df = manifest_df.repartition(resolved_settings["partitions"])
-    elif partition_by:
-        manifest_df = manifest_df.repartition(*partition_by)
+    verify_partition_columns(manifest_df, partition_by)
+    manifest_df = repartition_dataframe(
+        manifest_df,
+        resolved_settings["partitions"],
+        partition_by,
+    )
 
     if resolved_settings["sort_within_partitions"]:
         sort_columns = [col for col in ["pathology", "modality", "raw_path"] if col in manifest_df.columns]
@@ -201,10 +187,7 @@ def run_preprocess(spark: SparkSession, settings: dict[str, Any]) -> dict[str, A
             manifest_df = manifest_df.sortWithinPartitions(*sort_columns)
 
     output_path = resolved_settings["output_manifest_path"]
-    writer = manifest_df.write.mode("overwrite")
-    if partition_by:
-        writer = writer.partitionBy(*partition_by)
-    writer.parquet(output_path)
+    write_partitioned_parquet(manifest_df, output_path, partition_by)
 
     total_rows = manifest_df.count()
     return {
@@ -218,10 +201,7 @@ def main() -> None:
     args = _parse_args()
     settings = load_settings(args.config)
 
-    spark_builder = SparkSession.builder.appName(settings["app_name"])
-    if settings["master"]:
-        spark_builder = spark_builder.master(settings["master"])
-    spark = spark_builder.getOrCreate()
+    spark = build_spark_session(settings["app_name"], settings["master"])
 
     result = run_preprocess(spark, settings)
 
