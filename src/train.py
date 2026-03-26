@@ -14,7 +14,11 @@ from spark_jobs.config_utils import (
     as_positive_int,
     as_positive_int_or_none,
     load_config,
-    resolve_local_path,
+)
+from training.dataset_artifacts import (
+    load_dataset_summary,
+    load_split_files,
+    resolve_dataset_artifact_paths,
 )
 
 
@@ -40,15 +44,6 @@ def _parse_image_size(value: Any) -> tuple[int, int]:
     ):
         raise ValueError("`image_size` must be [height, width] with positive ints.")
     return int(value[0]), int(value[1])
-
-
-def _to_abs_local_path(path: str) -> Path:
-    local = Path(resolve_local_path(path))
-    if local.is_absolute():
-        return local
-    return (Path.cwd() / local).resolve()
-
-
 def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
     image_height, image_width = _parse_image_size(config.get("image_size", [224, 224]))
     model_output_dir = Path(str(config.get("model_output_dir", "models/baseline_cnn")))
@@ -94,55 +89,23 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings(config_path: str | None = "conf/train.yaml") -> dict[str, Any]:
     return _resolve_settings(load_config(config_path))
-
-
-def _collect_split_files(input_tfrecord_path: str) -> tuple[Path, dict[str, list[str]]]:
-    tfrecord_root = _to_abs_local_path(input_tfrecord_path)
+def _load_dataset_inputs(
+    input_tfrecord_path: str,
+) -> tuple[Path, dict[str, list[str]], dict[str, Any]]:
+    tfrecord_root, shard_manifest_path, summary_path = resolve_dataset_artifact_paths(
+        input_tfrecord_path
+    )
     if not tfrecord_root.exists():
         raise FileNotFoundError(f"TFRecord root path not found: {tfrecord_root}")
 
-    split_files = {
-        "train": sorted(
-            str(path) for path in tfrecord_root.glob("split=train/shard_id=*/*.tfrecord")
-        ),
-        "val": sorted(
-            str(path) for path in tfrecord_root.glob("split=val/shard_id=*/*.tfrecord")
-        ),
-        "test": sorted(
-            str(path) for path in tfrecord_root.glob("split=test/shard_id=*/*.tfrecord")
-        ),
-    }
+    split_files = load_split_files(tfrecord_root, shard_manifest_path)
     if not split_files["train"]:
         raise ValueError(
             "No training TFRecord files found under "
-            f"{tfrecord_root} with pattern split=train/shard_id=*/*.tfrecord"
+            f"{tfrecord_root} (manifest-aware lookup)."
         )
-    return tfrecord_root, split_files
-
-
-def _extract_label_idx(serialized_example: bytes) -> int:
-    example = tf.train.Example()
-    example.ParseFromString(serialized_example)
-    label_feature = example.features.feature.get("label_idx")
-    if label_feature is None or not label_feature.int64_list.value:
-        raise ValueError("Missing `label_idx` in TFRecord example.")
-    return int(label_feature.int64_list.value[0])
-
-
-def _scan_stats(split_files: dict[str, list[str]]) -> tuple[dict[str, int], set[int]]:
-    rows_by_split = {"train": 0, "val": 0, "test": 0}
-    labels: set[int] = set()
-
-    for split, files in split_files.items():
-        if not files:
-            continue
-        dataset = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
-        for raw_record in dataset:
-            serialized = bytes(raw_record.numpy())
-            rows_by_split[split] += 1
-            labels.add(_extract_label_idx(serialized))
-
-    return rows_by_split, labels
+    dataset_summary = load_dataset_summary(summary_path)
+    return tfrecord_root, split_files, dataset_summary
 
 
 _FEATURE_SPEC = {
@@ -263,19 +226,31 @@ def _build_model(
 def run_training(settings: dict[str, Any]) -> dict[str, Any]:
     resolved = _resolve_settings(settings)
     tf.keras.utils.set_random_seed(resolved["seed"])
-    tfrecord_root, split_files = _collect_split_files(resolved["input_tfrecord_path"])
+    tfrecord_root, split_files, dataset_summary = _load_dataset_inputs(
+        resolved["input_tfrecord_path"]
+    )
 
-    rows_by_split, labels = _scan_stats(split_files)
-    rows_train = int(rows_by_split["train"])
-    rows_val = int(rows_by_split["val"])
-    rows_test = int(rows_by_split["test"])
+    rows_by_split = dataset_summary.get("rows_by_split", {})
+    rows_train = int(rows_by_split.get("train", 0))
+    rows_val = int(rows_by_split.get("val", 0))
+    rows_test = int(rows_by_split.get("test", 0))
+    label_rows = dataset_summary.get("labels", [])
+    labels = {
+        int(row["label_idx"])
+        for row in label_rows
+        if row.get("label_idx") is not None
+    }
+
     if rows_train == 0:
         raise ValueError("No train records found in TFRecord dataset.")
 
     if resolved["num_classes"] is None:
-        if not labels:
+        if labels:
+            num_classes = max(labels) + 1
+        elif dataset_summary.get("distinct_labels") is not None:
+            num_classes = int(dataset_summary["distinct_labels"])
+        else:
             raise ValueError("Unable to infer `num_classes`: no labels found.")
-        num_classes = max(labels) + 1
     else:
         num_classes = int(resolved["num_classes"])
 
@@ -381,6 +356,7 @@ def run_training(settings: dict[str, Any]) -> dict[str, Any]:
     summary = {
         "settings": resolved,
         "input_tfrecord_path_resolved": str(tfrecord_root),
+        "dataset_summary_used": True,
         "rows_total": rows_train + rows_val + rows_test,
         "rows_train": rows_train,
         "rows_val": rows_val,

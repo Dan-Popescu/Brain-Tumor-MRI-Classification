@@ -10,7 +10,6 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import unquote, urlparse
 
 import numpy as np
 from PIL import Image
@@ -26,6 +25,14 @@ from spark_jobs.config_utils import (
     as_positive_int_or_none,
     load_config,
     parse_partition_columns,
+    resolve_local_path,
+)
+from spark_jobs.spark_df_utils import (
+    build_spark_session,
+    configure_shuffle_partitions,
+    repartition_dataframe,
+    verify_partition_columns,
+    write_partitioned_parquet,
 )
 
 
@@ -143,17 +150,6 @@ def load_settings(config_path: str | None = "conf/spark_transform.yaml") -> dict
 
 def _safe_partition_value(value: Any) -> str:
     return str(value).replace("/", "_")
-
-
-def _resolve_local_path(path: str) -> str:
-    if path.startswith("file:"):
-        parsed = urlparse(path)
-        if parsed.scheme == "file":
-            if parsed.netloc:
-                return unquote(f"//{parsed.netloc}{parsed.path}")
-            return unquote(parsed.path or path[len("file:") :])
-    return path
-
 
 def _resample_filter() -> Any:
     resampling = getattr(Image, "Resampling", None)
@@ -453,9 +449,8 @@ def _transform_partition(
         label_idx = row["label_idx"]
         modality = row["modality"]
         file_size = row["file_size"]
-        is_valid = row["is_valid"]
 
-        local_raw_path = _resolve_local_path(raw_path)
+        local_raw_path = resolve_local_path(raw_path)
         with Image.open(local_raw_path) as image:
             gray = image.convert("L")
             orig_w, orig_h = gray.size
@@ -478,7 +473,6 @@ def _transform_partition(
             label_idx,
             modality,
             file_size,
-            is_valid,
             png_bytes,
             len(png_bytes),
             int(orig_w),
@@ -499,7 +493,6 @@ def _output_schema() -> T.StructType:
             T.StructField("label_idx", T.IntegerType(), nullable=True),
             T.StructField("modality", T.StringType(), nullable=True),
             T.StructField("file_size", T.LongType(), nullable=True),
-            T.StructField("is_valid", T.BooleanType(), nullable=True),
             T.StructField("processed_bytes", T.BinaryType(), nullable=False),
             T.StructField("processed_file_size", T.LongType(), nullable=False),
             T.StructField("orig_width", T.IntegerType(), nullable=False),
@@ -524,7 +517,6 @@ def _build_transform_df(
         "label_idx",
         "modality",
         "file_size",
-        "is_valid",
     }
     missing = sorted(required_columns - set(manifest_df.columns))
     if missing:
@@ -539,7 +531,6 @@ def _build_transform_df(
         "label_idx",
         "modality",
         "file_size",
-        "is_valid",
     )
 
     transformed_rdd = base_df.rdd.mapPartitions(
@@ -621,41 +612,28 @@ def run_transform(spark: SparkSession, settings: dict[str, Any]) -> dict[str, An
     resolved_settings = _resolve_settings(settings)
     metadata_path = _write_version_metadata(resolved_settings)
 
-    if resolved_settings["shuffle_partitions"]:
-        spark.conf.set(
-            "spark.sql.shuffle.partitions",
-            resolved_settings["shuffle_partitions"],
-        )
+    configure_shuffle_partitions(
+        spark,
+        resolved_settings["shuffle_partitions"],
+    )
 
     manifest_df = spark.read.parquet(resolved_settings["input_manifest_path"])
     input_rows = manifest_df.count()
     transformed_df = _build_transform_df(spark, manifest_df, resolved_settings)
 
     partition_by = resolved_settings["partition_by"]
-    if partition_by:
-        unknown = [col for col in partition_by if col not in transformed_df.columns]
-        if unknown:
-            raise ValueError(
-                "Unknown partition columns: "
-                + ", ".join(unknown)
-                + ". Available columns: "
-                + ", ".join(transformed_df.columns)
-            )
+    verify_partition_columns(transformed_df, partition_by)
+    transformed_df = repartition_dataframe(
+        transformed_df,
+        resolved_settings["partitions"],
+        partition_by,
+    )
 
-    if resolved_settings["partitions"]:
-        if partition_by:
-            transformed_df = transformed_df.repartition(
-                resolved_settings["partitions"], *partition_by
-            )
-        else:
-            transformed_df = transformed_df.repartition(resolved_settings["partitions"])
-    elif partition_by:
-        transformed_df = transformed_df.repartition(*partition_by)
-
-    writer = transformed_df.write.mode("overwrite")
-    if partition_by:
-        writer = writer.partitionBy(*partition_by)
-    writer.parquet(resolved_settings["output_manifest_path"])
+    write_partitioned_parquet(
+        transformed_df,
+        resolved_settings["output_manifest_path"],
+        partition_by,
+    )
 
     debug_info = {
         "debug_rows_exported": 0,
@@ -683,10 +661,7 @@ def main() -> None:
     args = _parse_args()
     settings = load_settings(args.config)
 
-    spark_builder = SparkSession.builder.appName(settings["app_name"])
-    if settings["master"]:
-        spark_builder = spark_builder.master(settings["master"])
-    spark = spark_builder.getOrCreate()
+    spark = build_spark_session(settings["app_name"], settings["master"])
 
     result = run_transform(spark, settings)
 
