@@ -89,6 +89,7 @@ def _resolve_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings(config_path: str | None = "conf/train.yaml") -> dict[str, Any]:
     return _resolve_settings(load_config(config_path))
+
 def _load_dataset_inputs(
     input_tfrecord_path: str,
 ) -> tuple[Path, dict[str, list[str]], dict[str, Any]]:
