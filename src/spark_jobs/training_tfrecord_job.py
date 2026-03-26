@@ -225,17 +225,6 @@ def _write_partition_tfrecords(
             yield (split, shard_id, relative_path, rows_written)
 
 
-def _shard_manifest_schema() -> T.StructType:
-    return T.StructType(
-        [
-            T.StructField("export_id", T.StringType(), nullable=False),
-            T.StructField("split", T.StringType(), nullable=False),
-            T.StructField("shard_id", T.IntegerType(), nullable=False),
-            T.StructField("relative_path", T.StringType(), nullable=False),
-            T.StructField("rows_written", T.LongType(), nullable=False),
-        ]
-    )
-
 
 def _registry_schema() -> T.StructType:
     return T.StructType(

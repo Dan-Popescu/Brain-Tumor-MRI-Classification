@@ -15,7 +15,6 @@ models:
 enabled_outputs:
   - classification
   - anomaly_autoencoder
-  # - gradcam
 
 write_visual_artifacts: true 
 top_k: 5 

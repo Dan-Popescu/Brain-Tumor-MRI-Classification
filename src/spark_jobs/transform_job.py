@@ -194,7 +194,8 @@ def _resize_image(
 
 def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     height, width = mask.shape
-    visited = np.zeros((height, width), dtype=bool)
+    visited = np.zeros((height, width), dtype=bool)  # pixels linked to black border
+    # through neighbor pixels path
     stack: list[tuple[int, int]] = []
 
     def _push_if_background(row: int, col: int) -> None:
@@ -226,6 +227,7 @@ def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
 
 
 def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    
     height, width = mask.shape
     visited = np.zeros((height, width), dtype=bool)
     largest_component: list[tuple[int, int]] = []
@@ -235,14 +237,18 @@ def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
             if not mask[start_row, start_col] or visited[start_row, start_col]:
                 continue
 
+            # new useful pixels found
+
             stack = [(start_row, start_col)]
             component: list[tuple[int, int]] = []
-            visited[start_row, start_col] = True
+            visited[start_row, start_col] = True 
 
+            # explore the group
             while stack:
                 row, col = stack.pop()
                 component.append((row, col))
 
+                # check neighbor pixels
                 for row_offset, col_offset in (
                     (-1, 0),
                     (1, 0),
@@ -255,10 +261,14 @@ def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
                         continue
                     if not mask[next_row, next_col] or visited[next_row, next_col]:
                         continue
-                    visited[next_row, next_col] = True
+
+                    # add neighbor pixel to stack as useful pixel
+                    visited[next_row, next_col] = True  # avoid reexploring this pixel
+                    # to avoid counting same pixels multiple times because of neighbor comparisons
                     stack.append((next_row, next_col))
 
             if len(component) > len(largest_component):
+                # memorize biggest group so far
                 largest_component = component
 
     result = np.zeros_like(mask, dtype=bool)
@@ -271,6 +281,7 @@ def _extract_foreground_mask(
     image_array: np.ndarray,
     threshold: int,
 ) -> np.ndarray | None:
+    
     foreground = image_array > float(threshold)
     if not np.any(foreground):
         return None
@@ -286,6 +297,7 @@ def _crop_to_foreground(
     foreground_mask: np.ndarray,
     margin_pixels: int = 4,
 ) -> tuple[np.ndarray, np.ndarray]:
+    
     foreground_rows, foreground_cols = np.where(foreground_mask)
     top = max(0, int(foreground_rows.min()) - margin_pixels)
     bottom = min(image_array.shape[0], int(foreground_rows.max()) + margin_pixels + 1)
@@ -301,6 +313,7 @@ def _normalize_intensity(
     image_array: np.ndarray,
     foreground_mask: np.ndarray | None,
 ) -> np.ndarray:
+    
     values = image_array[foreground_mask] if foreground_mask is not None else image_array.reshape(-1)
     if values.size == 0:
         return image_array
@@ -418,7 +431,7 @@ def _upsert_transform_registry(
     )
 
     conf_key = "spark.sql.sources.partitionOverwriteMode"
-    previous_overwrite_mode = spark.conf.get(conf_key, "static")
+    previous_overwrite_mode = spark.conf.get(conf_key, "static") or "static"
     spark.conf.set(conf_key, "dynamic")
     try:
         (
@@ -569,6 +582,8 @@ def _export_debug_preview(transformed_df: DataFrame, settings: dict[str, Any]) -
     debug_version_root = (
         Path(settings["debug_export_path"]) / settings["transform_version"]
     ).resolve()
+    
+    # clean up debug folder destination
     if debug_version_root.is_symlink() or debug_version_root.is_file():
         debug_version_root.unlink()
     elif debug_version_root.exists():

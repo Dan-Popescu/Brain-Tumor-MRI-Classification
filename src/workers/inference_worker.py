@@ -28,7 +28,19 @@ def _parse_args() -> argparse.Namespace:
         default="conf/spark_inference.yaml",
         help="Path to inference config file.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=POLL_INTERVAL_SECONDS,
+        help=(
+            "Polling interval in seconds for scanning pending inference requests. "
+            f"Defaults to {POLL_INTERVAL_SECONDS}."
+        ),
+    )
+    args = parser.parse_args()
+    if args.poll_interval_seconds <= 0:
+        raise ValueError("`--poll-interval-seconds` must be > 0.")
+    return args
 
 
 def _utc_now_iso() -> str:
@@ -321,7 +333,11 @@ def _process_request(
     return result_payload
 
 
-def run_worker(config_path: str = "conf/spark_inference.yaml") -> None:
+def run_worker(
+    config_path: str = "conf/spark_inference.yaml",
+    *,
+    poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
+) -> None:
     raw_config = load_config(config_path)
     settings = _resolve_settings(raw_config)
 
@@ -335,12 +351,13 @@ def run_worker(config_path: str = "conf/spark_inference.yaml") -> None:
 
     print(f"[worker] watching {requests_root}")
     print(f"[worker] base config: {config_path}")
+    print(f"[worker] poll interval: {poll_interval_seconds:.2f}s")
 
     try:
         while True:
             pending_requests = _list_pending_requests(requests_root)
             if not pending_requests:
-                time.sleep(POLL_INTERVAL_SECONDS)
+                time.sleep(poll_interval_seconds)
                 continue
 
             request_dir = pending_requests[0]
@@ -390,4 +407,7 @@ def run_worker(config_path: str = "conf/spark_inference.yaml") -> None:
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_worker(args.config)
+    run_worker(
+        args.config,
+        poll_interval_seconds=args.poll_interval_seconds,
+    )
