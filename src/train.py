@@ -161,7 +161,7 @@ def _build_dataset(
             seed=seed,
         )
 
-    cycle_length = min(16, max(1, len(files)))
+    cycle_length = min(4, max(1, len(files)))
     dataset = file_ds.interleave(
         lambda path: tf.data.TFRecordDataset(path),
         cycle_length=cycle_length,
